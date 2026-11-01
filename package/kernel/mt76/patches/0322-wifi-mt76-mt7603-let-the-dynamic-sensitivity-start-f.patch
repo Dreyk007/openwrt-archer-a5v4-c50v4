@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Sun, 1 Nov 2026 20:50:05 +0200
+Subject: [PATCH] wifi: mt76: mt7603: let the dynamic sensitivity start from 0
+
+Since commit f7e9be89db59 ("mt76: mt7603: add upper limit for dynamic
+sensitivity minimum receive power") mt7603_false_cca_check() only raises
+the sensitivity while dev->sensitivity < -100 + dev->sensitivity_limit,
+i.e. below -72 dBm with the default limit of 28. The sensitivity starts
+at 0, which means "off", and 0 is not below -72, so the first step to
+-92 never happens: the dynamic sensitivity of the 2.4 GHz radio stays
+off however many false CCA events the radio counts.
+
+Treat 0 as the start, as the branch below it already does.
+
+Fixes: f7e9be89db59 ("mt76: mt7603: add upper limit for dynamic sensitivity minimum receive power")
+---
+ mt7603/mac.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/mt7603/mac.c b/mt7603/mac.c
+index fa0bf9a..85de95c 100644
+--- a/mt7603/mac.c
++++ b/mt7603/mac.c
+@@ -1819,7 +1819,8 @@ mt7603_false_cca_check(struct mt7603_dev *dev)
+ 
+ 	false_cca = dev->false_cca_ofdm + dev->false_cca_cck;
+ 	if (false_cca > 600 &&
+-	    dev->sensitivity < -100 + dev->sensitivity_limit) {
++	    (!dev->sensitivity ||
++	     dev->sensitivity < -100 + dev->sensitivity_limit)) {
+ 		if (!dev->sensitivity)
+ 			dev->sensitivity = -92;
+ 		else
+-- 
+2.53.0
+

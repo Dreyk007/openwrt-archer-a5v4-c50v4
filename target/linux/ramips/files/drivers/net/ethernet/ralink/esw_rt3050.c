@@ -226,6 +226,8 @@ struct rt305x_esw {
 
 	unsigned char		port_map;
 	unsigned char		port_disable;
+	/* WAN ports kept disabled from a reset until userspace applies a configuration */
+	unsigned char		wan_isolated;
 	unsigned int		reg_initval_fct2;
 	unsigned int		reg_initval_fpa2;
 	unsigned int		reg_led_polarity;
@@ -518,6 +520,20 @@ static void esw_hw_init(struct rt305x_esw *esw)
 	 * after having enabled all possible ports above
 	 */
 	port_disable |= esw_get_port_disable(esw);
+
+	/* The empty configuration puts all ports into one VLAN, and the VLANs of
+	 * the board only come from userspace, tens of seconds after boot on these
+	 * SoCs: meanwhile the LAN ports would be bridged to the WAN port, and LAN
+	 * clients get leases from the ISP. Keep the ports that mediatek,portmap
+	 * leaves out of the LAN disabled until a configuration is applied. The
+	 * bootloader of TP-Link starts the kernel with the PHYs disabled.
+	 */
+	if (esw->port_map)
+		esw->wan_isolated = RT305X_ESW_PORTS_NOCPU & ~esw->port_map &
+				    ~port_disable;
+	else
+		esw->wan_isolated = 0;
+	port_disable |= esw->wan_isolated;
 
 	for (i = 0; i < 6; i++)
 		esw->ports[i].disable = (port_disable & (1 << i)) != 0;
@@ -838,6 +854,20 @@ static int esw_apply_config(struct switch_dev *dev)
 	return 0;
 }
 
+/* The configuration from userspace ends the isolation of the WAN ports */
+static int esw_apply_user_config(struct switch_dev *dev)
+{
+	struct rt305x_esw *esw = container_of(dev, struct rt305x_esw, swdev);
+	int i;
+
+	for (i = 0; i < RT305X_ESW_NUM_LANWAN; i++)
+		if (esw->wan_isolated & BIT(i))
+			esw->ports[i].disable = 0;
+	esw->wan_isolated = 0;
+
+	return esw_apply_config(dev);
+}
+
 static int esw_reset_switch(struct switch_dev *dev)
 {
 	struct rt305x_esw *esw = container_of(dev, struct rt305x_esw, swdev);
@@ -1036,6 +1066,7 @@ static int esw_set_port_bool(struct switch_dev *dev,
 	switch (attr->id) {
 	case RT305X_ESW_ATTR_PORT_DISABLE:
 		esw->ports[idx].disable = val->value.i;
+		esw->wan_isolated &= ~BIT(idx);
 		break;
 	case RT305X_ESW_ATTR_PORT_DOUBLETAG:
 		esw->ports[idx].doubletag = val->value.i;
@@ -1382,7 +1413,7 @@ static const struct switch_dev_ops esw_ops = {
 	.get_port_pvid = esw_get_port_pvid,
 	.set_port_pvid = esw_set_port_pvid,
 	.get_port_link = esw_get_port_link,
-	.apply_config = esw_apply_config,
+	.apply_config = esw_apply_user_config,
 	.reset_switch = esw_reset_switch,
 };
 

@@ -20,6 +20,8 @@ PKG_LICENSE:=ISC
 
 PKG_ABI_VERSION:=20230711
 PKG_BUILD_DEPENDS:=libmd
+# LuCI runs on ucode: its interpreter in full MIPS32 code, not MIPS16
+PKG_BUILD_FLAGS:=no-mips16
 HOST_BUILD_DEPENDS:=libjson-c/host
 
 include $(INCLUDE_DIR)/package.mk

@@ -1543,7 +1543,6 @@ define KernelPackage/wireguard
 	  CONFIG_WIREGUARD \
 	  CONFIG_WIREGUARD_DEBUG=n
   FILES:=$(LINUX_DIR)/drivers/net/wireguard/wireguard.ko
-  AUTOLOAD:=$(call AutoProbe,wireguard)
 endef
 
 define KernelPackage/wireguard/description

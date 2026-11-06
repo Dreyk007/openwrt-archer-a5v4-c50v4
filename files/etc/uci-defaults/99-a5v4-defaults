@@ -1,0 +1,84 @@
+#!/bin/sh
+#
+# Default settings of the Archer A5 v4 / C50 v4 build.
+#
+# uci-defaults scripts run on the first boot after every flash, including a sysupgrade that keeps
+# settings. These defaults are applied only once per configuration: a marker is stored in
+# /etc/config/a5v4, which sysupgrade keeps together with the rest of /etc/config, so that changes
+# of the user survive firmware upgrades. Defaults added later have markers of their own, so that
+# configurations made with an earlier version of the build get them too.
+#
+# Wi-Fi radio defaults are set by /etc/uci-defaults/77_wireless.
+
+# Encrypted DNS (DoH), as in the AX3200 build: https-dns-proxy points dnsmasq at its local
+# instances (Cloudflare, Google) and only at them. LAN clients keep their own DNS settings:
+# forcing them onto the router would also block DNS over TLS, which breaks the Private DNS of
+# Android. conn_loss_time 30 lets the instances keep their connections over a WAN reconnect.
+if [ -f /etc/config/https-dns-proxy ] && [ "$(uci -q get a5v4.defaults.doh)" != "1" ]; then
+	uci set https-dns-proxy.config.dnsmasq_config_update='*'
+	uci set https-dns-proxy.config.force_dns='0'
+	uci set https-dns-proxy.config.conn_loss_time='30'
+	uci -q commit https-dns-proxy
+	touch /etc/config/a5v4
+	uci set a5v4.defaults='defaults'
+	uci set a5v4.defaults.doh='1'
+	uci -q commit a5v4
+fi
+
+[ "$(uci -q get a5v4.defaults.applied)" = "1" ] && exit 0
+
+# Firewall: software flow offloading, the fast path of routing and NAT on this one-core router
+uci set firewall.@defaults[0].flow_offloading='1'
+
+# Drop the packets that conntrack marks invalid, as in the AX3200 build: otherwise those from the LAN
+# leave through the WAN without NAT, with their LAN source address
+[ -z "$(uci -q get firewall.@defaults[0].drop_invalid)" ] && uci set firewall.@defaults[0].drop_invalid='1'
+
+# Stealth firewall, as in the AX3200 build: the WAN zone and the global defaults (for interfaces in
+# no zone) drop what they do not accept instead of answering with a reject, so the router does not
+# show its closed ports to the internet. Only a policy still at the stock REJECT changes, so that a
+# configuration kept from another firmware keeps its own choices. The router still answers ping from
+# the WAN (OpenWrt's Allow-Ping rule): what the WAN can reach is decided by the ports, which stay
+# closed, and ping lets the ISP and the owner check the line.
+for opt in input forward; do
+	[ "$(uci -q get firewall.@defaults[0].$opt)" = "REJECT" ] && uci set firewall.@defaults[0].$opt='DROP'
+done
+for zone in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='wan'$/\1/p"); do
+	for opt in input forward; do
+		[ "$(uci -q get firewall."$zone".$opt)" = "REJECT" ] && uci set firewall."$zone".$opt='DROP'
+	done
+done
+
+uci -q commit firewall
+
+# SSH only on the addresses of the LAN interface, as in the AX3200 build: defence in depth behind the
+# policy of the WAN zone. Through WireGuard the router stays reachable at its LAN address.
+if uci -q get dropbear.@dropbear[0] >/dev/null; then
+	[ -z "$(uci -q get dropbear.@dropbear[0].Interface)" ] && uci set dropbear.@dropbear[0].Interface='lan'
+	uci -q commit dropbear
+fi
+
+# NTP server for the LAN (busybox ntpd)
+uci set system.ntp.enable_server='1'
+uci -q commit system
+
+# IPTV is off until it is set up. The igmpproxy package enables its service with a WAN -> LAN
+# configuration, and its init script then opens the firewall for multicast from the WAN. Its
+# upstream "altnet 192.168.1.0/24" makes igmpproxy ignore the reports of LAN clients (it matches
+# them to the upstream first), so the upstream accepts any source instead, as IPTV setups do.
+if [ -f /etc/config/igmpproxy ]; then
+	upstream="$(uci -q show igmpproxy | sed -n "s/^igmpproxy\.\([^.]*\)\.direction='upstream'$/\1/p" | head -n 1)"
+	if [ -n "$upstream" ]; then
+		uci -q delete igmpproxy."$upstream".altnet
+		uci add_list igmpproxy."$upstream".altnet='0.0.0.0/0'
+		uci -q commit igmpproxy
+	fi
+	/etc/init.d/igmpproxy disable 2>/dev/null
+fi
+
+touch /etc/config/a5v4
+uci set a5v4.defaults='defaults'
+uci set a5v4.defaults.applied='1'
+uci -q commit a5v4
+
+exit 0

@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Fri, 6 Nov 2026 02:00:00 +0200
+Subject: [PATCH] mtd: spi-nor: a faster clock after a read check at boot
+
+Boards of one model carry flash chips of several makers, and the
+highest clock that reads correctly differs between them: the plain
+Read (03h) of some is specified up to 50 MHz, of others up to 80 MHz,
+and the time a chip takes to drive its data decides how fast a
+controller that samples early can go. spi-max-frequency has to suit
+the slowest chip, so the others run slower than they could.
+
+Add openwrt,fast-frequencies to the flash node: the clocks to try,
+highest first. The chip reads the start of the flash at
+spi-max-frequency and then twice at each of these clocks; the first
+clock whose reads are equal becomes the clock of the device, before
+its partitions are registered. If none passes, it keeps
+spi-max-frequency. openwrt,fast-flash, if present, limits this to
+chips listed by JEDEC ID and the CRC-32 of their SFDP tables. The log
+names the chip and the clock it got.
+---
+--- a/drivers/mtd/spi-nor/core.c
++++ b/drivers/mtd/spi-nor/core.c
+@@ -7,6 +7,7 @@
+  * Copyright (C) 2014, Freescale Semiconductor, Inc.
+  */
+ 
++#include <linux/crc32.h>
+ #include <linux/err.h>
+ #include <linux/errno.h>
+ #include <linux/delay.h>
+@@ -2156,6 +2157,96 @@
+ }
+ 
+ /*
++ * A faster clock than spi-max-frequency, kept if a read check at boot passes.
++ *
++ * openwrt,fast-frequencies = <Hz>, ...: the clocks to try, highest first.
++ * openwrt,fast-flash = <jedec-id sfdp-crc32>, ... (optional): only these chips, by the first
++ * three bytes of their JEDEC ID and the CRC-32 of their SFDP tables (0: any SFDP).
++ *
++ * The chip reads the start of the flash at spi-max-frequency, then twice at each clock; the
++ * first clock whose reads equal the one at spi-max-frequency becomes the clock of the device.
++ * If none does, it keeps spi-max-frequency. The start of the flash holds the bootloader on the
++ * boards that use this, which nothing writes. The log names the chip, so that reports of
++ * users show which chips pass.
++ */
++#define SPI_NOR_FAST_CHECK_LEN	SZ_128K
++
++static void spi_nor_select_fast_clock(struct spi_nor *nor)
++{
++	struct device_node *np = spi_nor_get_flash_node(nor);
++	struct spi_device *spi = nor->spimem ? nor->spimem->spi : NULL;
++	u32 safe, id = 0, crc = 0, want_id, want_crc, hz;
++	size_t len, retlen;
++	bool listed = false;
++	u8 *ref = NULL, *buf = NULL;
++	int n, i, k;
++
++	n = of_property_count_u32_elems(np, "openwrt,fast-frequencies");
++	if (!spi || n < 1)
++		return;
++
++	safe = spi->max_speed_hz;
++	if (nor->id)
++		id = nor->id[0] << 16 | nor->id[1] << 8 | nor->id[2];
++	if (nor->sfdp)
++		crc = ~crc32_le(~0, (const u8 *)nor->sfdp->dwords,
++				nor->sfdp->num_dwords * sizeof(*nor->sfdp->dwords));
++
++	k = of_property_count_u32_elems(np, "openwrt,fast-flash");
++	if (k >= 2) {
++		for (i = 0; i + 1 < k; i += 2) {
++			if (of_property_read_u32_index(np, "openwrt,fast-flash", i, &want_id) ||
++			    of_property_read_u32_index(np, "openwrt,fast-flash", i + 1, &want_crc))
++				break;
++			if (want_id == id && (!want_crc || want_crc == crc))
++				listed = true;
++		}
++		if (!listed) {
++			dev_info(nor->dev, "%06x (SFDP CRC-32 %08x): not listed, up to %u Hz\n",
++				 id, crc, safe);
++			return;
++		}
++	}
++
++	len = min_t(u64, SPI_NOR_FAST_CHECK_LEN, nor->mtd.size);
++	ref = kmalloc(len, GFP_KERNEL);
++	buf = kmalloc(len, GFP_KERNEL);
++	if (!ref || !buf)
++		goto out;
++
++	retlen = 0;
++	if (spi_nor_read(&nor->mtd, 0, len, &retlen, ref) || retlen != len)
++		goto out;
++
++	for (i = 0; i < n; i++) {
++		if (of_property_read_u32_index(np, "openwrt,fast-frequencies", i, &hz) ||
++		    hz <= safe)
++			continue;
++
++		spi->max_speed_hz = hz;
++		for (k = 0; k < 2; k++) {
++			retlen = 0;
++			if (spi_nor_read(&nor->mtd, 0, len, &retlen, buf) || retlen != len ||
++			    memcmp(ref, buf, len))
++				break;
++		}
++		if (k == 2) {
++			dev_info(nor->dev, "%06x (SFDP CRC-32 %08x): up to %u Hz, %zu bytes read the same as at %u Hz\n",
++				 id, crc, hz, len, safe);
++			goto out;
++		}
++		spi->max_speed_hz = safe;
++		dev_warn(nor->dev, "%06x (SFDP CRC-32 %08x): a read at up to %u Hz differed from one at %u Hz\n",
++			 id, crc, hz, safe);
++	}
++out:
++	if (spi->max_speed_hz == safe)
++		dev_info(nor->dev, "%06x (SFDP CRC-32 %08x): stays at up to %u Hz\n", id, crc, safe);
++	kfree(buf);
++	kfree(ref);
++}
++
++/*
+  * On Octal DTR capable flashes, writes cannot start or end at an odd address
+  * in Octal DTR mode. Extra 0xff bytes need to be appended or prepended to
+  * make sure the start address and end address are even. 0xff is used because
+@@ -3791,6 +3882,8 @@
+ 	if (ret)
+ 		return ret;
+ 
++	spi_nor_select_fast_clock(nor);
++
+ 	return mtd_device_register(&nor->mtd, data ? data->parts : NULL,
+ 				   data ? data->nr_parts : 0);
+ }

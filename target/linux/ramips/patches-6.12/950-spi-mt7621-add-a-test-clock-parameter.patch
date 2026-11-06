@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Thu, 5 Nov 2026 03:00:00 +0200
+Subject: [PATCH] spi: mt7621: add test clock parameters
+
+The clock of a SPI flash comes from the device tree, so trying a faster
+one means a new image, and an image whose flash does not read back at
+that clock does not boot. Add test_speed_hz: when set, every transfer
+runs at this clock instead. A running system can then read the flash
+at higher clocks and compare it with what it read at the device tree's
+clock, before a device tree is built with a faster one. 0, the default,
+changes nothing.
+
+Add test_read_speed_hz for the messages that carry dummy bytes, which
+on a SPI NOR flash with m25p,fast-read are its Fast Read (0Bh). Some
+flashes allow Fast Read at a higher clock than their status and ID
+commands, so the read can be tried there while writes keep polling the
+status at a clock the flash allows. 0, the default, changes nothing.
+---
+--- a/drivers/spi/spi-mt7621.c
++++ b/drivers/spi/spi-mt7621.c
+@@ -25,6 +25,26 @@
+ /* in usec */
+ #define RALINK_SPI_WAIT_MAX_LOOP 2000
+ 
++/*
++ * Clock for every transfer instead of the one of the device tree, in Hz (0: the device tree's),
++ * so that a clock can be tried on a running system before a device tree is built with it.
++ * /sys/module/spi_mt7621/parameters/test_speed_hz
++ */
++static unsigned int test_speed_hz;
++module_param(test_speed_hz, uint, 0644);
++MODULE_PARM_DESC(test_speed_hz, "SPI clock of every transfer for tests, in Hz (0: the device tree's)");
++
++/*
++ * Clock for the messages that contain dummy bytes, in Hz (0: as the other messages), i.e. the
++ * Fast Read (0Bh) of a SPI NOR flash with m25p,fast-read. Status, write and erase commands keep
++ * the other clock, so that a flash whose plain commands are slower than its Fast Read can be
++ * tried at the clock of the Fast Read alone.
++ * /sys/module/spi_mt7621/parameters/test_read_speed_hz
++ */
++static unsigned int test_read_speed_hz;
++module_param(test_read_speed_hz, uint, 0644);
++MODULE_PARM_DESC(test_read_speed_hz, "SPI clock of messages with dummy bytes (fast read) for tests, in Hz (0: as the others)");
++
+ /* SPISTAT register bit field */
+ #define SPISTAT_BUSY		BIT(0)
+ 
+@@ -164,12 +184,22 @@
+ 	struct spi_device *spi = m->spi;
+ 	unsigned int speed = spi->max_speed_hz;
+ 	struct spi_transfer *t = NULL;
++	bool dummy = false;
+ 
+ 	mt7621_spi_wait_till_ready(rs);
+ 
+-	list_for_each_entry(t, &m->transfers, transfer_list)
++	list_for_each_entry(t, &m->transfers, transfer_list) {
+ 		if (t->speed_hz < speed)
+ 			speed = t->speed_hz;
++		if (t->dummy_data)
++			dummy = true;
++	}
++
++	if (test_speed_hz)
++		speed = test_speed_hz;
++
++	if (dummy && test_read_speed_hz)
++		speed = test_read_speed_hz;
+ 
+ 	return mt7621_spi_prepare(spi, speed);
+ }

@@ -105,3 +105,23 @@
 		nvmem-cell-names = "eeprom", "mac-address";
 	};
 };
+
+&spi0 {
+	flash@0 {
+		/*
+		 * The controller divides its bus clock of 193.3 MHz by a whole number of at least 2
+		 * and samples the data half a period after the flash drives it.
+		 *
+		 * 48.3 MHz (divided by 4) for any chip, instead of 10 MHz: within the 50 MHz that
+		 * the Winbond W25Q64 and cFeon EN25QH64A of some units allow for plain reads, and
+		 * half a period (10.35 ns) is longer than any of the known chips needs to drive
+		 * its data (6-8 ns).
+		 *
+		 * 64.4 MHz (divided by 3) for any chip whose reads at it equal one at 48.3 MHz at
+		 * boot (patch 951 of ramips); the GigaDevice GD25Q64 of the test unit passes. 96.7 MHz
+		 * (divided by 2) reads it wrong even with Fast Read.
+		 */
+		spi-max-frequency = <50000000>;
+		openwrt,fast-frequencies = <65000000>;
+	};
+};

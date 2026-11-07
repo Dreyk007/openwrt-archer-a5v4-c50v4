@@ -62,20 +62,6 @@ fi
 uci set system.ntp.enable_server='1'
 uci -q commit system
 
-# IPTV is off until it is set up. The igmpproxy package enables its service with a WAN -> LAN
-# configuration, and its init script then opens the firewall for multicast from the WAN. Its
-# upstream "altnet 192.168.1.0/24" makes igmpproxy ignore the reports of LAN clients (it matches
-# them to the upstream first), so the upstream accepts any source instead, as IPTV setups do.
-if [ -f /etc/config/igmpproxy ]; then
-	upstream="$(uci -q show igmpproxy | sed -n "s/^igmpproxy\.\([^.]*\)\.direction='upstream'$/\1/p" | head -n 1)"
-	if [ -n "$upstream" ]; then
-		uci -q delete igmpproxy."$upstream".altnet
-		uci add_list igmpproxy."$upstream".altnet='0.0.0.0/0'
-		uci -q commit igmpproxy
-	fi
-	/etc/init.d/igmpproxy disable 2>/dev/null
-fi
-
 touch /etc/config/a5v4
 uci set a5v4.defaults='defaults'
 uci set a5v4.defaults.applied='1'

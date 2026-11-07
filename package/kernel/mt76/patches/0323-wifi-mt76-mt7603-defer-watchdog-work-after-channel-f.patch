@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ivan <ivan.ns@mail.ru>
+Date: Thu, 22 Oct 2026 10:41:19 +0200
+Subject: [PATCH] wifi: mt76: mt7603: defer watchdog work after channel failure
+
+mt76_set_channel() holds dev->mutex while invoking the driver's
+set_channel callback. If mt7603_mcu_set_channel() fails,
+mt7603_set_channel() calls mt7603_mac_work() synchronously. That work
+takes the same mutex, so the caller deadlocks before returning to the
+core's unlock.
+
+Before b80c997b3ff6, mt7603_set_channel() released the mutex itself
+before calling the work function. Moving the lock to the core left this
+error path with a recursive mutex acquisition.
+
+Queue the watchdog work instead. It can run once the callback returns
+and the core releases the mutex. The core cancels mac_work before
+changing the channel, and the success path already schedules the same
+work.
+
+Observed on MT7628AN / TP-Link TL-MR3420 v5, OpenWrt 24.10.4, kernel
+6.6.110, mt76 6467af3b. A radio restart after repeated Beacon stuck
+resets reported "MCU message 08 ... timed out", followed by hostapd
+blocked at mt7603_mac_work's mutex_lock. Other wireless operations,
+dnsmasq and driver removal then blocked as well.
+
+This addresses the channel-error recovery deadlock; it does not
+establish or fix the original cause of the stuck beacons.
+
+Fixes: b80c997b3ff6 ("wifi: mt76: partially move channel change code to core")
+Signed-off-by: Ivan <ivan.ns@mail.ru>
+Link: https://github.com/openwrt/mt76/pull/1166 (not merged on 2026-11-06)
+---
+ mt7603/main.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/mt7603/main.c b/mt7603/main.c
+index 757664e9e..1fbc778e5 100644
+--- a/mt7603/main.c
++++ b/mt7603/main.c
+@@ -193,7 +193,8 @@ int mt7603_set_channel(struct mt76_phy *mphy)
+ 	tasklet_enable(&dev->mt76.pre_tbtt_tasklet);
+ 
+ 	if (failed)
+-		mt7603_mac_work(&dev->mphy.mac_work.work);
++		ieee80211_queue_delayed_work(mt76_hw(dev),
++					     &dev->mphy.mac_work, 0);
+ 
+ 	return ret;
+ }

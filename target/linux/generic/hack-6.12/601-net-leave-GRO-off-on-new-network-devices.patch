@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Fri, 6 Nov 2026 21:00:00 +0200
+Subject: [PATCH] net: leave GRO off on new network devices
+
+GRO merges the received packets of a flow into larger ones before they
+are forwarded. On a router whose Ethernet and Wi-Fi can neither
+checksum nor segment in hardware (the MT7628 of the Archer C50 v4),
+every merged packet is split and checksummed again in software before
+it is sent on. Without GRO, forwarding on that router took 5-17 % less
+CPU per Mbit/s, uploads from Wi-Fi were 10 % faster and WireGuard 7-8 %.
+
+Register network devices with GRO off, so that every interface is
+covered, also those created later (guest access points, a Wi-Fi uplink,
+tunnels), without configuration. GRO stays a changeable feature:
+netifd's device option gro or ethtool turns it on for a device, and
+fraglist GRO (600-net-enable-fraglist-GRO-by-default.patch) is still
+set for when it is.
+---
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -10578,10 +10578,10 @@ int register_netdevice(struct net_device
+ 	dev->ifindex = ret;
+ 
+ 	/* Transfer changeable features to wanted_features and enable
+-	 * software offloads (GSO and GRO).
++	 * software offloads (GSO; GRO stays off until it is turned on).
+ 	 */
+ 	dev->hw_features |= (NETIF_F_SOFT_FEATURES | NETIF_F_SOFT_FEATURES_OFF);
+-	dev->features |= NETIF_F_SOFT_FEATURES;
++	dev->features |= NETIF_F_SOFT_FEATURES & ~NETIF_F_GRO;
+ 
+ 	if (dev->udp_tunnel_nic_info) {
+ 		dev->features |= NETIF_F_RX_UDP_TUNNEL_PORT;

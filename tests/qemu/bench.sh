@@ -265,6 +265,34 @@ t_no_unknown_symbols() { ! r dmesg | grep -i 'unknown symbol'; }
 t_kernel_clean() { ! r dmesg | grep -E -i 'Oops|BUG:|Kernel panic|Call Trace|segfault'; }
 t_uci_defaults_done() { [ -z "$(r 'ls /etc/uci-defaults')" ]; }
 t_router_wifi_drivers() { r 'lsmod' | grep -q '^mt7603e' && r 'lsmod' | grep -q '^mt76x2e'; }
+# The delay interrupts of both radios by default (mt76 patches 0326 and 0327: delay_int 0x9032880a)
+t_mt76_delay_int() { [ "$(r 'cat /sys/module/mt76x02_lib/parameters/delay_int')" = 2419230730 ] &&
+    [ "$(r 'cat /sys/module/mt7603e/parameters/delay_int')" = 2419230730 ]; }
+# GRO off on every network device by the kernel of the build (hack patch 601), without any
+# configuration, and threaded NAPI on eth0 (/etc/init.d/a5v4-threaded-napi; on malta eth0 comes
+# from a module, on the router from a built-in driver); netifd's device status reads the GRO flag
+# from the kernel
+t_gro_no_config() { ! r 'uci -q show network' | grep -q '\.gro='; }
+dev_gro_off() {
+    r "ubus call network.device status '{\"name\":\"$1\"}'" | grep -q '"gro": false' || { echo "$1: GRO not off"; return 1; }
+}
+t_gro_off_eth0() { dev_gro_off eth0; }
+t_threaded_napi() {
+    [ "$(r 'cat /sys/class/net/eth0/threaded')" = 1 ] || { echo "eth0 threaded: $(r 'cat /sys/class/net/eth0/threaded')"; return 1; }
+    r 'grep -l "^napi/eth0-" /proc/[0-9]*/comm' | grep -q . || { echo "no napi/eth0 thread"; return 1; }
+}
+# Every Wi-Fi interface: the access point (radio0) and the client (radio1) of the bench
+t_gro_off_wifi() {
+    local devs d
+    devs="$(r 'iw dev' | awk '$1 == "Interface" {print $2}')"
+    [ -n "$devs" ] || { echo "no Wi-Fi interface"; return 1; }
+    for d in $devs; do dev_gro_off "$d" || return 1; done
+}
+t_gro_off_wg() { dev_gro_off wg0; }
+# A device section with gro 1 turns GRO on (set before the reboot at the end, on the WAN card)
+t_gro_on_by_section() {
+    r "ubus call network.device status '{\"name\":\"$WANDEV\"}'" | grep -q '"gro": true' || { echo "$WANDEV: GRO not on"; return 1; }
+}
 
 # --- LAN services
 t_lan_dhcp() { nsx lan udhcpc -i eth0 -n -q -f -t 5 -x hostname:benchclient -s /bin/true; }
@@ -492,7 +520,9 @@ wg_up() { r 'ubus call network.interface.wg0 status' | grep -q '"up": true'; }
 wg_ssh_once() { nsx wan ssh "${SSH_OPTS[@]}" root@192.168.1.1 true; }
 t_wg_ssh() { wait_for 30 wg_ssh_once || wg_ssh_once; }
 
-# --- IPTV: a multicast stream on the WAN side, a receiver in the LAN
+# --- Multicast from the WAN (IPTV): a stream on the WAN side, a receiver in the LAN. The build has
+# no IPTV since 2026-11-06 (RESEARCH.md section 8); the igmpproxy and udpxy checks stay for an image
+# that carries them again
 MC_GROUP=239.255.1.1
 MC_PORT=5004
 mc_send() { # a stream from the WAN host for $1 seconds
@@ -535,6 +565,10 @@ t_iptv_udpxy() {
        uci commit firewall; fw4 -q reload" >/dev/null && sleep 3 &&
         [ "$(nsx lan curl -s --max-time 8 "http://192.168.1.1:4022/udp/$MC_GROUP:$MC_PORT" | head -c 1000 | wc -c)" -ge 1000 ]
 }
+# Without IPTV: no multicast routing in the kernel (IPv4 and IPv6), and a LAN client that joins a
+# group gets nothing from the WAN
+t_no_mroute() { ! r '[ -e /proc/net/ip_mr_vif ] || [ -e /proc/net/ip6_mr_vif ]'; }
+t_no_mc_lan() { ! mc_receive; }
 
 # --- Wi-Fi: an access point on one hwsim radio, a WPA2 client of it on the other
 t_radios() { [ "$(r 'ls /sys/class/ieee80211 | wc -l')" -ge 2 ]; }
@@ -629,8 +663,17 @@ if r '[ -f /rom/etc/uci-defaults/99-a5v4-defaults ]'; then
 else
     skip "first-boot defaults" "the image has no 99-a5v4-defaults"
 fi
+NETDEF="$(r '[ -f /rom/etc/init.d/a5v4-threaded-napi ] && echo yes || echo no')"
+if [ "$NETDEF" = yes ]; then
+    check "GRO: no gro option in /etc/config/network" t_gro_no_config
+    check "GRO off on eth0" t_gro_off_eth0
+    check "threaded NAPI on eth0" t_threaded_napi
+else
+    skip "GRO off and threaded NAPI" "the image does not set them"
+fi
 if r 'ls /lib/modules/*/mt7603e.ko' >/dev/null 2>&1; then
     check "router Wi-Fi drivers load (mt7603e, mt76x2e)" t_router_wifi_drivers
+    check "mt76x02 and mt7603: delay interrupts by default (delay_int)" t_mt76_delay_int
 else
     skip "router Wi-Fi drivers load" "the image has no mt7603e"
 fi
@@ -731,6 +774,9 @@ else
     check "WireGuard handshake" t_wg_handshake
     check "SSH to the router's LAN address through the tunnel" t_wg_ssh
     check "WireGuard module loaded with the tunnel" t_wg_mod_loaded
+    if [ "$NETDEF" = yes ]; then
+        check "GRO off on wg0" t_gro_off_wg
+    fi
 fi
 
 section "AmneziaWG"
@@ -779,9 +825,14 @@ else
     check "AmneziaWG with obfuscation: handshake between two interfaces" t_awg_obfuscated
 fi
 
-section "IPTV"
+section "Multicast from the WAN (IPTV)"
 if ! has igmpproxy; then
-    skip "IPTV" "the image has no igmpproxy"
+    mc_send 25
+    if [ "$SOURCE" = local ]; then
+        check "no multicast routing in the kernel" t_no_mroute
+    fi
+    check "no multicast from the WAN reaches the LAN" t_no_mc_lan
+    wait "$MC_PID" || true
 else
     mc_send 95
     check "IPTV off by default: no multicast from the WAN" t_iptv_default_off
@@ -829,9 +880,15 @@ r "uci set wireless.radio0.disabled=0; uci set wireless.radio1.disabled=0
    uci set network.wwan=interface; uci set network.wwan.proto=none
    uci commit; /etc/init.d/network reload" >/dev/null
 check "WPA2 client associates with the access point" t_wifi_wpa2
+if [ "$NETDEF" = yes ]; then
+    check "GRO off on the Wi-Fi access point and client" t_gro_off_wifi
+fi
 if [ "$SAE" = yes ]; then
     check "WPA2 client associates with a WPA2/WPA3 access point" t_wifi_assoc sae-mixed psk2
     check "WPA3 client associates with a WPA2/WPA3 access point" t_wifi_assoc sae-mixed sae
+    if [ "$NETDEF" = yes ]; then
+        check "GRO off on the Wi-Fi interfaces after wifi down and up" t_gro_off_wifi
+    fi
 else
     skip "WPA3" "hostapd of the image has no SAE"
 fi
@@ -840,6 +897,9 @@ section "Persistence"
 check "no kernel Oops, BUG or panic" t_kernel_clean
 info "memory after the tests: $(r "grep -E 'MemAvailable' /proc/meminfo" | tr -s ' ')"
 r "uci set system.@system[0].hostname=benchrouter; uci commit system; sync" >/dev/null
+if [ "$NETDEF" = yes ]; then
+    r "s=\$(uci add network device); uci set network.\$s.name='$WANDEV'; uci set network.\$s.gro=1; uci commit network; sync" >/dev/null
+fi
 r 'reboot' >/dev/null 2>&1 || true
 ssh_down() { ! r true; }
 wait_for 120 ssh_down || true
@@ -848,6 +908,12 @@ info "second boot to SSH: $BOOT2_SECS s"
 t_persist() { [ "$(r 'uci get system.@system[0].hostname')" = benchrouter ]; }
 check "settings survive a reboot (overlay)" t_persist
 check "no kernel Oops, BUG or panic after the reboot" t_kernel_clean
+if [ "$NETDEF" = yes ]; then
+    # the init script runs at every boot
+    check "GRO off on eth0 after the reboot" t_gro_off_eth0
+    check "threaded NAPI on eth0 after the reboot" t_threaded_napi
+    check "a device section with gro 1 turns GRO on ($WANDEV)" t_gro_on_by_section
+fi
 
 echo "Failed: $FAILS, skipped: $SKIPS" | tee -a "$RESULTS"
 

@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Fri, 6 Nov 2026 23:00:00 +0200
+Subject: [PATCH] wifi: mt76: mt76x02: optional delay interrupts
+
+The WPDMA raises one interrupt per TX completion and per RX batch. The
+init table of mt76x2 configures a TX delay interrupt (0x94ff0000: 20
+frames or 5.1 ms), but MT_INT_TXDELAYINT is never added to the interrupt
+mask, so the setting does nothing (openwrt/mt76 PR #1138 found that on a
+host with INTx it wedges the line instead).
+
+Add the module parameter delay_int, written to MT_WPDMA_DELAY_INT_CFG
+when the device starts: for each direction whose delay interrupt it
+enables, the driver takes MT_INT_RXDELAYINT (main RX ring) or
+MT_INT_TXDELAYINT in place of the done interrupts. The MCU RX ring keeps
+its own interrupt. The default of this build, 0x9032880a, raises a TX
+interrupt after 16 frames or 1 ms and an RX one after 8 frames or 200 us;
+0 keeps one interrupt per event (the unused TX setting of the init table
+goes either way). The interrupt handler
+acks the raw pending set before masking it, as in PR #1138, so that the
+done bits of a ring that uses its delay interrupt cannot stay pending.
+
+On a single-core MT7628 with an MT7612E, where the 5 GHz radio is bound
+by the CPU, it took a third fewer interrupts at the same throughput and
+CPU per Mbit/s; the owner keeps it on to watch it in use.
+---
+--- a/mt76x02.h
++++ b/mt76x02.h
+@@ -119,6 +119,9 @@ struct mt76x02_dev {
+ 	u8 beacon_hang_check;
+ 	u8 mcu_timeout;
+ 
++	/* MT_WPDMA_DELAY_INT_CFG since the last start (module parameter delay_int) */
++	u32 delay_int;
++
+ 	struct mt76x02_rate_power rate_power;
+ 
+ 	struct mt76x02_calibration cal;
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -11,6 +11,35 @@
+ #include "mt76x02_mcu.h"
+ #include "trace.h"
+ 
++/* The delay interrupts of the WPDMA: an interrupt after a number of done
++ * events or a time, whichever comes first, in place of one per TX completion
++ * and RX batch. Written at the start of the device (wifi up).
++ */
++static unsigned int delay_int = 0x9032880a;
++module_param(delay_int, uint, 0644);
++MODULE_PARM_DESC(delay_int,
++		 "MT_WPDMA_DELAY_INT_CFG at start: TX in bits 31-16, RX in bits 15-0, each enable (15), frames (14-8), time in 20 us (7-0); 0: off; default 0x9032880a");
++
++#define MT76X02_DELAY_INT_EN		BIT(15)
++#define MT76X02_DELAY_INT_TX_SHIFT	16
++
++/* The interrupt of the main RX ring; the MCU ring keeps its own */
++static u32 mt76x02_rx_main_int(struct mt76x02_dev *dev)
++{
++	if (dev->delay_int & MT76X02_DELAY_INT_EN)
++		return MT_INT_RXDELAYINT;
++
++	return MT_INT_RX_DONE(MT_RXQ_MAIN);
++}
++
++static u32 mt76x02_tx_done_int(struct mt76x02_dev *dev)
++{
++	if ((dev->delay_int >> MT76X02_DELAY_INT_TX_SHIFT) & MT76X02_DELAY_INT_EN)
++		return MT_INT_TXDELAYINT;
++
++	return MT_INT_TX_DONE_ALL;
++}
++
+ static void mt76x02_pre_tbtt_tasklet(struct tasklet_struct *t)
+ {
+ 	struct mt76x02_dev *dev = from_tasklet(dev, t, mt76.pre_tbtt_tasklet);
+@@ -161,7 +190,7 @@ static int mt76x02_poll_tx(struct napi_s
+ 		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], false);
+ 
+ 	if (napi_complete_done(napi, 0))
+-		mt76x02_irq_enable(dev, MT_INT_TX_DONE_ALL);
++		mt76x02_irq_enable(dev, mt76x02_tx_done_int(dev));
+ 
+ 	mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[MT_MCUQ_WM], false);
+ 	for (i = MT_TXQ_PSD; i >= 0; i--)
+@@ -251,7 +280,10 @@ void mt76x02_rx_poll_complete(struct mt7
+ 	struct mt76x02_dev *dev;
+ 
+ 	dev = container_of(mdev, struct mt76x02_dev, mt76);
+-	mt76x02_irq_enable(dev, MT_INT_RX_DONE(q));
++	if (q == MT_RXQ_MAIN)
++		mt76x02_irq_enable(dev, mt76x02_rx_main_int(dev));
++	else
++		mt76x02_irq_enable(dev, MT_INT_RX_DONE(q));
+ }
+ EXPORT_SYMBOL_GPL(mt76x02_rx_poll_complete);
+ 
+@@ -261,21 +293,27 @@ irqreturn_t mt76x02_irq_handler(int irq,
+ 	u32 intr, mask;
+ 
+ 	intr = mt76_rr(dev, MT_INT_SOURCE_CSR);
+-	intr &= dev->mt76.mmio.irqmask;
++	/*
++	 * Ack the raw pending set before masking: a source the driver does not
++	 * enable (the done bits of a ring whose delay interrupt is used, or a
++	 * delay interrupt that is not used) would otherwise never be cleared,
++	 * which can wedge a level-triggered INTx line (openwrt/mt76 PR #1138).
++	 */
+ 	mt76_wr(dev, MT_INT_SOURCE_CSR, intr);
++	intr &= dev->mt76.mmio.irqmask;
+ 
+ 	if (!test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state))
+ 		return IRQ_NONE;
+ 
+ 	trace_dev_irq(&dev->mt76, intr, dev->mt76.mmio.irqmask);
+ 
+-	mask = intr & (MT_INT_RX_DONE_ALL | MT_INT_GPTIMER);
+-	if (intr & (MT_INT_TX_DONE_ALL | MT_INT_TX_STAT))
+-		mask |= MT_INT_TX_DONE_ALL;
++	mask = intr & (MT_INT_RX_DONE_ALL | MT_INT_RXDELAYINT | MT_INT_GPTIMER);
++	if (intr & (MT_INT_TX_DONE_ALL | MT_INT_TXDELAYINT | MT_INT_TX_STAT))
++		mask |= mt76x02_tx_done_int(dev);
+ 
+ 	mt76x02_irq_disable(dev, mask);
+ 
+-	if (intr & MT_INT_RX_DONE(0))
++	if (intr & (MT_INT_RX_DONE(0) | MT_INT_RXDELAYINT))
+ 		napi_schedule(&dev->mt76.napi[0]);
+ 
+ 	if (intr & MT_INT_RX_DONE(1))
+@@ -295,7 +333,7 @@ irqreturn_t mt76x02_irq_handler(int irq,
+ 	if (intr & MT_INT_TX_STAT)
+ 		mt76x02_mac_poll_tx_status(dev, true);
+ 
+-	if (intr & (MT_INT_TX_STAT | MT_INT_TX_DONE_ALL))
++	if (intr & (MT_INT_TX_STAT | MT_INT_TX_DONE_ALL | MT_INT_TXDELAYINT))
+ 		napi_schedule(&dev->mt76.tx_napi);
+ 
+ 	if (intr & MT_INT_GPTIMER)
+@@ -341,9 +379,14 @@ void mt76x02_mac_start(struct mt76x02_de
+ 	mt76_wr(dev, MT_MAC_SYS_CTRL,
+ 		MT_MAC_SYS_CTRL_ENABLE_TX |
+ 		MT_MAC_SYS_CTRL_ENABLE_RX);
++
++	dev->delay_int = delay_int;
++	mt76_wr(dev, MT_WPDMA_DELAY_INT_CFG, dev->delay_int);
++	mt76x02_irq_disable(dev, MT_INT_RX_DONE(MT_RXQ_MAIN) | MT_INT_RXDELAYINT |
++				 MT_INT_TX_DONE_ALL | MT_INT_TXDELAYINT);
+ 	mt76x02_irq_enable(dev,
+-			   MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_ALL |
+-			   MT_INT_TX_STAT);
++			   mt76x02_rx_main_int(dev) | MT_INT_RX_DONE(MT_RXQ_MCU) |
++			   mt76x02_tx_done_int(dev) | MT_INT_TX_STAT);
+ }
+ EXPORT_SYMBOL_GPL(mt76x02_mac_start);
+ 
+--- a/mt76x2/init.c
++++ b/mt76x2/init.c
+@@ -155,7 +155,7 @@ void mt76_write_mac_initvals(struct mt76
+ 		{ MT_EFUSE_CTRL,		0x0000d000 },
+ 		{ MT_PAUSE_ENABLE_CONTROL1,	0x0000000a },
+ 		{ MT_FCE_WLAN_FLOW_CONTROL1,	0x60401c18 },
+-		{ MT_WPDMA_DELAY_INT_CFG,	0x94ff0000 },
++		{ MT_WPDMA_DELAY_INT_CFG,	0x00000000 },
+ 		{ MT_TX_SW_CFG3,		0x00000004 },
+ 		{ MT_HT_FBK_TO_LEGACY,		0x00001818 },
+ 		{ MT_VHT_HT_FBK_CFG1,		0xedcba980 },

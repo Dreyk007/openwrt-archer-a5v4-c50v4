@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Sat, 7 Nov 2026 02:00:00 +0200
+Subject: [PATCH] wifi: mt76: mt7603: delay interrupts
+
+The WPDMA of the mt7603 raises one interrupt per TX completion and per
+RX batch; MT_DELAY_INT_CFG, written 0 at init, can instead raise one
+after a number of done events or a time. Its status bits are in no
+header: on an MT7628 the RX delay interrupt sets bit 22 of
+MT_INT_SOURCE_CSR and the TX one bit 23 (MT_DELAY_INT_CFG set for one
+direction at a time while the source register was read under traffic).
+
+Add the module parameter delay_int, as for mt76x02: written at the start
+of the device, and for each direction it enables the driver takes
+MT_INT_RX_DLY (main RX ring) or MT_INT_TX_DLY in place of the done
+interrupts; the MCU RX ring keeps its own. The default of this build,
+0x9032880a, raises a TX interrupt after 16 frames or 1 ms and an RX one
+after 8 frames or 200 us; 0 keeps one interrupt per event. The watchdog
+reset writes the configuration again with the interrupts it enables.
+The interrupt handler already acks the raw status.
+---
+--- a/mt7603/core.c
++++ b/mt7603/core.c
+@@ -3,11 +3,32 @@
+ #include "mt7603.h"
+ #include "../trace.h"
+ 
++/* The delay interrupts of the WPDMA: an interrupt after a number of done
++ * events or a time, whichever comes first, in place of one per TX completion
++ * and RX batch. Written at the start of the device (wifi up).
++ */
++static unsigned int delay_int = 0x9032880a;
++module_param(delay_int, uint, 0644);
++MODULE_PARM_DESC(delay_int,
++		 "MT_DELAY_INT_CFG at start: TX in bits 31-16, RX in bits 15-0, each enable (15), frames (14-8), time in 20 us (7-0); 0: off; default 0x9032880a");
++
++void mt7603_set_delay_int(struct mt7603_dev *dev)
++{
++	dev->delay_int = delay_int;
++	mt76_wr(dev, MT_DELAY_INT_CFG, dev->delay_int);
++	mt7603_irq_disable(dev, MT_INT_RX_DONE(MT_RXQ_MAIN) | MT_INT_RX_DLY |
++				MT_INT_TX_DONE_ALL | MT_INT_TX_DLY);
++	mt7603_irq_enable(dev, mt7603_rx_main_int(dev) | mt7603_tx_done_int(dev));
++}
++
+ void mt7603_rx_poll_complete(struct mt76_dev *mdev, enum mt76_rxq_id q)
+ {
+ 	struct mt7603_dev *dev = container_of(mdev, struct mt7603_dev, mt76);
+ 
+-	mt7603_irq_enable(dev, MT_INT_RX_DONE(q));
++	if (q == MT_RXQ_MAIN)
++		mt7603_irq_enable(dev, mt7603_rx_main_int(dev));
++	else
++		mt7603_irq_enable(dev, MT_INT_RX_DONE(q));
+ }
+ 
+ irqreturn_t mt7603_irq_handler(int irq, void *dev_instance)
+@@ -36,14 +57,14 @@ irqreturn_t mt7603_irq_handler(int irq,
+ 			mt76_csa_finish(&dev->mt76);
+ 	}
+ 
+-	if (intr & MT_INT_TX_DONE_ALL) {
+-		mt7603_irq_disable(dev, MT_INT_TX_DONE_ALL);
++	if (intr & (MT_INT_TX_DONE_ALL | MT_INT_TX_DLY)) {
++		mt7603_irq_disable(dev, mt7603_tx_done_int(dev));
+ 		napi_schedule(&dev->mt76.tx_napi);
+ 	}
+ 
+-	if (intr & MT_INT_RX_DONE(0)) {
++	if (intr & (MT_INT_RX_DONE(0) | MT_INT_RX_DLY)) {
+ 		dev->rx_pse_check = 0;
+-		mt7603_irq_disable(dev, MT_INT_RX_DONE(0));
++		mt7603_irq_disable(dev, mt7603_rx_main_int(dev));
+ 		napi_schedule(&dev->mt76.napi[0]);
+ 	}
+ 
+--- a/mt7603/dma.c
++++ b/mt7603/dma.c
+@@ -176,7 +176,7 @@ static int mt7603_poll_tx(struct napi_st
+ 		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], false);
+ 
+ 	if (napi_complete_done(napi, 0))
+-		mt7603_irq_enable(dev, MT_INT_TX_DONE_ALL);
++		mt7603_irq_enable(dev, mt7603_tx_done_int(dev));
+ 
+ 	mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[MT_MCUQ_WM], false);
+ 	for (i = MT_TXQ_PSD; i >= 0; i--)
+--- a/mt7603/mac.c
++++ b/mt7603/mac.c
+@@ -1373,7 +1373,9 @@ void mt7603_mac_dma_start(struct mt7603_
+ 		  FIELD_PREP(MT_WPDMA_GLO_CFG_DMA_BURST_SIZE, 3) |
+ 		  MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE));
+ 
+-	mt7603_irq_enable(dev, MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_ALL);
++	mt76_wr(dev, MT_DELAY_INT_CFG, dev->delay_int);
++	mt7603_irq_enable(dev, mt7603_rx_main_int(dev) | MT_INT_RX_DONE(1) |
++			       mt7603_tx_done_int(dev));
+ }
+ 
+ void mt7603_mac_start(struct mt7603_dev *dev)
+--- a/mt7603/main.c
++++ b/mt7603/main.c
+@@ -13,6 +13,7 @@ mt7603_start(struct ieee80211_hw *hw)
+ {
+ 	struct mt7603_dev *dev = hw->priv;
+ 
++	mt7603_set_delay_int(dev);
+ 	mt7603_mac_reset_counters(dev);
+ 	mt7603_mac_start(dev);
+ 	dev->mphy.survey_time = ktime_get_boottime();
+--- a/mt7603/mt7603.h
++++ b/mt7603/mt7603.h
+@@ -111,6 +111,9 @@ struct mt7603_dev {
+ 
+ 	u32 rxfilter;
+ 
++	/* MT_DELAY_INT_CFG since the last start (module parameter delay_int) */
++	u32 delay_int;
++
+ 	struct mt7603_sta global_sta;
+ 
+ 	u32 agc0, agc3;
+@@ -193,6 +196,21 @@ static inline void mt7603_irq_enable(str
+ 	mt76_set_irq_mask(&dev->mt76, MT_INT_MASK_CSR, 0, mask);
+ }
+ 
++/* The interrupt of the main RX ring and of TX completions: the delay
++ * interrupt of that direction when delay_int enables it
++ */
++static inline u32 mt7603_rx_main_int(struct mt7603_dev *dev)
++{
++	return (dev->delay_int & BIT(15)) ? MT_INT_RX_DLY : MT_INT_RX_DONE(0);
++}
++
++static inline u32 mt7603_tx_done_int(struct mt7603_dev *dev)
++{
++	return (dev->delay_int & BIT(31)) ? MT_INT_TX_DLY : MT_INT_TX_DONE_ALL;
++}
++
++void mt7603_set_delay_int(struct mt7603_dev *dev);
++
+ static inline void mt7603_irq_disable(struct mt7603_dev *dev, u32 mask)
+ {
+ 	mt76_set_irq_mask(&dev->mt76, MT_INT_MASK_CSR, mask, 0);
+--- a/mt7603/regs.h
++++ b/mt7603/regs.h
+@@ -32,6 +32,9 @@
+ 
+ #define MT_INT_RX_COHERENT		BIT(20)
+ #define MT_INT_TX_COHERENT		BIT(21)
++/* the delay interrupts of MT_DELAY_INT_CFG (found on an MT7628: not in the vendor headers) */
++#define MT_INT_RX_DLY			BIT(22)
++#define MT_INT_TX_DLY			BIT(23)
+ #define MT_INT_MAC_IRQ3			BIT(27)
+ 
+ #define MT_INT_MCU_CMD			BIT(30)

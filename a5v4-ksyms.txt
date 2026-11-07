@@ -360,6 +360,7 @@ param_array_ops
 param_ops_bool
 param_ops_charp
 param_ops_int
+param_ops_uint
 pci_disable_device
 pci_enable_device
 pci_set_master

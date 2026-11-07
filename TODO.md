@@ -21,16 +21,17 @@ The plan decided on 2026-11-01. In this order; every step records its size cost
   [RESEARCH.md section 4](RESEARCH.md#4-ipv6));
 - the approved packages: LuCI in Russian, WireGuard and AmneziaWG (modules loaded with a tunnel,
   [RESEARCH.md section 13](RESEARCH.md#13-vpn-wireguard-and-amneziawg)), DoH with `https-dns-proxy` as in
-  openwrt-ax3200 ([RESEARCH.md section 14](RESEARCH.md#14-encrypted-dns-doh)), travelmate, IPTV with `igmpproxy` and `udpxy`,
+  openwrt-ax3200 ([RESEARCH.md section 14](RESEARCH.md#14-encrypted-dns-doh)), travelmate,
   without apk, the HTTPS client and `urngd` ([RESEARCH.md section 2](RESEARCH.md#2-size-of-the-programs));
+  IPTV (`igmpproxy`, `udpxy`) and multicast routing left out on 2026-11-06
+  ([RESEARCH.md section 8](RESEARCH.md#8-routing-acceleration-and-iptv));
 - 22 fixes of mt76 master and the own fix of the mt7603 dynamic sensitivity
   ([RESEARCH.md section 6](RESEARCH.md#6-wi-fi-driver-fixes-from-mt76-master));
 - Wi-Fi on at the first boot: country PA, 2.4 GHz `HT20` on channel 1, 5 GHz `VHT80` on channel 36,
   WPA2 with the password `12345678` of the seed (the README must warn about it).
 - the first-boot defaults (`files/etc/uci-defaults/99-a5v4-defaults`): flow offloading, the WAN zone
   and the global defaults dropping instead of rejecting (as in openwrt-ax3200: only a policy still at
-  the stock `REJECT`; ping from the WAN is still answered), the NTP server, IPTV off (`igmpproxy` disabled, upstream `altnet 0.0.0.0/0`). The README
-  tells how to turn IPTV on (for `udpxy` a firewall rule that accepts multicast UDP from the WAN).
+  the stock `REJECT`; ping from the WAN is still answered), the NTP server.
 - busybox without `brctl`, `mkswap`, `swapon`, `swapoff` and `taskset`; `build.sh` rebuilds busybox
   when the image has links of applets it no longer has.
 - WPA3 (`wpad-basic-mbedtls`): 5 GHz WPA2/WPA3 mixed mode by default, 2.4 GHz WPA2; `drop_invalid`
@@ -43,6 +44,10 @@ The plan decided on 2026-11-01. In this order; every step records its size cost
 - The flowtable hotplug script of openwrt-ax3200 (`20-firewall-wifi`) is not needed: with software
   offloading the flowtable holds `br-lan`, not the Wi-Fi interfaces
   ([RESEARCH.md section 8](RESEARCH.md#8-routing-acceleration-and-iptv)).
+- GRO off and threaded NAPI on `eth0` (decided on 2026-11-06,
+  [RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router)): GRO off on every network device by
+  the kernel (`target/linux/generic/hack-6.12/601-…`), threaded NAPI from
+  `files/etc/init.d/a5v4-threaded-napi`; the QEMU bench checks both.
 
 1. **The router.** A full dump of all partitions before the first flash (`radio` and `rom` are
     unique to the unit), then `sysupgrade` (`-f` with a configuration tested in QEMU keeps the
@@ -57,9 +62,12 @@ The plan decided on 2026-11-01. In this order; every step records its size cost
       in LuCI; SSH only at the LAN address, also through WireGuard), what the
       build changes and leaves out ([RESEARCH.md section 10](RESEARCH.md#10-what-the-image-leaves-out)),
       flash and RAM, the packages, setting up WISP, WireGuard and AmneziaWG (remote access through
-      a VPS, full tunnel) and IPTV; DoH: on by default, ISP pages that rely on its DNS do not open,
+      a VPS, full tunnel); no IPTV over multicast (the ISP's own router or set-top box; a set-top
+      box on its own VLAN works with the switch settings); DoH: on by default, ISP pages that rely on its DNS do not open,
       no name resolves while DoH is unreachable, and how to turn it off
-      ([RESEARCH.md section 14](RESEARCH.md#14-encrypted-dns-doh)); `BUILDING.md`, `BUILDING.ru.md`; the measurements in RESEARCH.md; the
+      ([RESEARCH.md section 14](RESEARCH.md#14-encrypted-dns-doh)); GRO off and threaded NAPI: what
+      they give, and how to turn them on or off (a device section with `gro '1'`,
+      `a5v4.network.threaded_napi`); `BUILDING.md`, `BUILDING.ru.md`; the measurements in RESEARCH.md; the
       tables of UPGRADING.md.
     - `.github/workflows/build-a5v4.yml` after `build-ax3200.yml` (no `release.json` and
       fwupdate): the build in the container, `sha256sums`, attestation, tag `v25.12.6-a5v4-r1`.
@@ -74,7 +82,7 @@ Record the setup, the numbers and the decision of each in [RESEARCH.md](RESEARCH
 ### Build and QEMU
 
 `tests/qemu/bench.sh` automates the checks marked *(bench)*; extend it when a step adds what it
-needs (an `igmpproxy` test with the IPTV step, travelmate tests with the WISP step). The image
+needs (travelmate tests with the WISP step). The image
 never exceeds 7616 KiB; the reference build matched the official image (RESEARCH.md, *Method and
 sources*).
 - **Sizes of the open decisions:** busybox applets one by one (a list with sizes is in RESEARCH.md
@@ -103,14 +111,16 @@ sources*).
 - **Flow offloading coverage:** `[OFFLOAD]` for LAN → WAN and a PPPoE WAN *(bench)*, WireGuard and
   the WISP client interface. After `wifi reload` the flowtable still holds `br-lan` and, once its
   interface is up again, the WISP client interface *(bench, by hand)*.
-- **IPTV:** with `igmpproxy` enabled (and `altnet 0.0.0.0/0`), a multicast group sent in the WAN
-  namespace reaches a receiver in the LAN namespace that joined it, with `igmpproxy` stopped it does
-  not, and `udpxy` serves the same group at `http://192.168.1.1:4022/udp/<group>:<port>` *(bench)*;
-  with the defaults no multicast passes from the WAN *(bench)*; still to add: the stream stops after
-  the receiver leaves (`quickleave`).
+- **No IPTV:** no multicast routing in the kernel, and a LAN client that joins a group gets no
+  multicast from the WAN *(bench)*. The checks of `igmpproxy` and `udpxy` stay in the bench for an
+  image that carries them again (they need `altnet 0.0.0.0/0`, RESEARCH.md section 8).
 - **travelmate on `mac80211_hwsim`:** it switches between two upstream networks; when the upstream
   disappears the local access point on the same radio stays up; it reconnects when the upstream
   comes back.
+- **GRO and threaded NAPI:** no `gro` option in the configuration, GRO off on `eth0`, on the Wi-Fi
+  access point and client (also after `wifi down; wifi up`) and on `wg0`, threaded NAPI on `eth0`
+  with its `napi/eth0-*` thread, both again after a reboot, and a device section with `gro '1'`
+  turns GRO on *(bench)*.
 - **First boot:** `/etc/uci-defaults` is empty afterwards, the defaults are set *(bench)*; they apply once
   (marker; test with a sysupgrade that keeps settings); without
   `urngd` the time to `crng init done` and to the dropbear host keys stays short.
@@ -142,28 +152,42 @@ sources*).
 - **`JUMP_LABEL`** (off in OpenWrt, supported on MIPS): static keys of the packet path (netfilter
   hooks, ingress/egress) become patched no-ops instead of a memory read per packet. A/B of the CPU
   load at the same throughput, the kernel size, stability over a day.
-- **GRO on `eth0`:** without TX checksum offload on the MT7628 (the driver enables only RX
-  checksums), merged packets are segmented and checksummed in software again. A/B with
-  `ethtool -K eth0 gro off` (copy `ethtool` to `/tmp`): CPU load at wired NAT 94 Mbit/s and at
-  Wi-Fi → LAN; set the better one as the default. On the router (2026-11-03) `eth0` has GRO on and
-  TX checksums off, and both Wi-Fi interfaces have neither GSO nor scatter-gather, so every
-  packet merged on the WAN side is split again in software before it goes to Wi-Fi. Switching GRO
-  does not reset the link. Three states, since GRO without fraglist would make Wi-Fi segment with
-  copies: GRO with fraglist (the default), GRO without fraglist, no GRO, on `eth0` and both radios,
-  downloads and uploads apart. `tests/router/abwatch.sh` runs this A/B on the real traffic of the
-  site with `kprof` profiles. Done with iperf3 on 2026-11-05
-  ([RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router)): no GRO costs 5–17 % less CPU
-  per Mbit/s, GRO without fraglist the most. With a server in the site's LAN: no GRO with threaded
-  NAPI on `eth0` is the best state, and without threaded NAPI a LAN → Wi-Fi download starves every
-  process for 1 s (10 s without GRO). Decide the defaults: `threaded` and `gro` 0 as netifd device
-  options of `eth0` (no flash), and GRO off on the Wi-Fi interfaces, which netifd's `gro` option may
-  not reach (try it; else a hotplug script needs `ethtool` or a kernel default).
-- **mt76x02 reads MT7612E registers over PCIe for every frame** (2026-11-05): `mt76_dma_tx_cleanup`
+- **GRO off and threaded NAPI on the router** (the defaults since 2026-11-06,
+  [RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router)): flash the image with them (the
+  owner's OK), check them with the commands of
+  [UPGRADING.md appendix C](UPGRADING.md#appendix-c-on-device-verification), and measure in this
+  state what was not measured: the client of travelmate and a long run with the real traffic of
+  the site. Then the boot with a series of reboots (the boot item below). Done on 2026-11-06: GRO
+  off everywhere, WireGuard the same with GRO off on `wg0`, threaded NAPI at boot from the init
+  script (the debug image `o2-dev-irq`).
+- **mt76x02 reads MT7612E registers over PCIe for every frame** (2026-11-05; handed to other
+  developers as tasks on 2026-11-07, the agent reviews their results): `mt76_dma_tx_cleanup`
   and `mt76_mmio_rr` take about a quarter of the CPU of a 90 Mbit/s download on 5 GHz: the DMA
   index of each TX queue on every cleanup, two words of the TX status FIFO per frame. Candidates:
   fewer reads (skip idle queues, read the status FIFO in batches or only for the frames that rate
-  control samples), RX interrupt coalescing in `MT_WPDMA_DELAY_INT_CFG`; measure each with
-  `labtest.sh`, then offer upstream (openwrt/mt76).
+  control samples), and the delay interrupts of `MT_WPDMA_DELAY_INT_CFG` for RX and TX in place of
+  the per-frame ones (TX is configured but unused, RESEARCH.md section 12; the interrupt handler
+  must then acknowledge the raw status, as openwrt/mt76 PR #1138 does); measure each with
+  `labtest.sh`, then offer upstream (openwrt/mt76). The delay interrupts are in `0326` (`delay_int`
+  of `mt76x02_lib`, applied at `wifi up`, off by default) and work (2026-11-06); left: their effect
+  with a 5 GHz client. The phone did not come back after the restart of the radio that applies them
+  (2026-11-07). Measured with a phone reconnected by hand (2026-11-07): a third fewer interrupts,
+  the same throughput and CPU in UDP from the router and LAN ↔ 5 GHz (RESEARCH.md section 12); on by
+  default since then, the owner's choice, to watch it in use (latency on 5 GHz, MCU timeouts or
+  stalls in `logread`, the watchdog of mt76x02). The reads over PCIe in the TX cleanup remain the
+  candidate for CPU.
+- **Interrupt moderation of `eth0`** (2026-11-06, RESEARCH.md section 8): the `ralink` driver turns
+  the delay interrupt of the frame engine off, the mainline `mtk_eth_soc` moderates it with net DIM
+  on the MT7628. First, without a new image, `napi_defer_hard_irqs` and `gro_flush_timeout` of
+  `eth0` (the kernel's own moderation); then a fixed delay in `FE_REG_DLY_INT_CFG`, then DIM ported
+  from `mtk_eth_soc`. Measure the CPU per Mbit/s of a wired download and LAN → Wi-Fi with
+  `labtest.sh`, and the latency of a ping under load. On 2026-11-06 the kernel's deferral and the
+  delay interrupt (`ethtool -C`, in the driver since then) changed nothing for WireGuard at about
+  2300 packets/s and cost 0.05–0.2 ms of ping (RESEARCH.md section 12). With the PC on the cable
+  at 85–90 Mbit/s (2026-11-07) the delay interrupt at 200 µs saved about a fifth of the CPU per
+  Mbit/s both ways (0.67 → 0.54 and 0.58 → 0.46 %/Mbit) with a third of the interrupts. On by
+  default since 2026-11-07 (`FE_DLY_INT_DEFAULT` in the driver); perhaps 100 µs at the same load
+  later.
 - **Wi-Fi ↔ internet is bound by the CPU at about 65–75 Mbit/s** (2026-11-03, a phone on 5 GHz, a
   speed test, the download of another client paused). Near the router: −31…−43 dBm, VHT MCS 9 with
   2 streams both ways, 45–67 Mbit/s, CPU idle 13–26 %. In a far room: −70…−81 dBm, 60–66 Mbit/s,
@@ -180,30 +204,28 @@ sources*).
   TX retries and failures per packet, the power-save device's counters; then bisect if they differ.
   The router sends UDP at 45 Mbit/s to a strong one-stream client on 2.4 GHz (2026-11-05), so the
   radio is not the limit: test the phone again with UDP from the router (`tests/router/udptest.sh`)
-  and with TCP, awake and in power save.
+  and with TCP, awake and in power save. On 2026-11-06 the same phone at −65 dBm (MCS 15, 2
+  streams, screen off) took UDP from the router at 26–37 Mbit/s with 0.01–0.04 retries per frame
+  and no failed frame, and TCP through the internet at up to 45 Mbit/s down and 86 up: not
+  reproduced there. By day (09:30–10:20, the phone perhaps moved and in use) it did show:
+  downloads of 3–13 Mbit/s with 0.5–1.9 retries per frame and hundreds of failed frames, the CPU
+  mostly idle, while at night, with the phone asleep, it was fast. The phone streams audio to
+  Bluetooth headphones almost all the time (the owner): Bluetooth takes the phone's 2.4 GHz radio
+  from Wi-Fi, which explains slow downloads with fast uploads, and 5 GHz fast. Left, to close it:
+  a download with the headphones playing and one without, the phone at the same place (someone at
+  the site). If that confirms it, the router has nothing to fix, and the A/B without the fork's
+  mt76 patches is not needed.
 - **mt7603 dynamic sensitivity** (the own fix; on 2026-11-05 seen moving −100…−82 dBm on a busy
   channel and back to 0, near the weakest client's RSSI − 15 dB; the A/B below is left): the debug
   image; `Sensitivity:` in
   `/sys/kernel/debug/ieee80211/phy0/mt76/radio` leaves 0 on a busy channel and never goes above the
   weakest client's RSSI − 15 dB; A/B of the channel busy time and of ping loss to the clients, as
   for the MT7622 in openwrt-ax3200. Then submit the fix to openwrt/mt76.
-- **mt7603 hangs when the 2.4 GHz radio is reconfigured under load** (seen on 2026-11-03, a serious
-  bug): `htmode` HT20 → HT40 and `wifi up radio0` while a download with many TCP flows kept the
-  channel 88 % busy. At the teardown of `phy0-ap0` the firmware did not answer `MCU message 08`
-  (`MCU_EXT_CMD_CHANNEL_SWITCH`),
-  hostapd stayed in `D` in `sendmsg` with `iw` and the `ipv6_addrconf` kworker behind it, the
-  2.4 GHz network was gone (5 GHz and wired kept forwarding), and only a reboot brought it back.
-  With the download paused the same `wifi up radio0` passed twice (HT40, HT40 with `noscan`), and
-  so did the switch back HT40 → HT20 under load (26 Mbit/s): load seems needed, but does not always
-  cause it. Find out how often it happens (repeated switches under load, both directions), whether
-  other changes do it (channel, TX power, `wifi reload`), whether the 22 backported commits or the
-  sensitivity fix play a part (an image without them), and what holds the locks: a dev build with
-  `KALLSYMS` and debugfs
-  (`/proc/<pid>/stack`, `echo w > /proc/sysrq-trigger`). Then a fix or a report to openwrt/mt76.
-  On the debug image (2026-11-05, `tests/router/hangload.sh`): 27 switches, 15 idle and 12 under a
-  UDP stream of 20–45 Mbit/s, without a hang. Left: TCP with many flows to a client and
-  the release kernel. The OpenWrt forum reports 2.4 GHz stopping under heavy traffic until a reboot on
-  21.02 and 22.03, without a reconfiguration ([RESEARCH.md section 16](RESEARCH.md#16-the-openwrt-forum)).
+- **Open mt7603 changes of openwrt/mt76, taken on 2026-11-06** (`0324` PR #941, `0325` PR #1136):
+  RSSI from RCPI instead of IBRssi, which swings 15–20 dB near the router with the gain of the LNA;
+  the two clients read steady values (RESEARCH.md section 12). Left: the dynamic sensitivity of the
+  build over a day with `dbglog.sh`, since it follows the weakest client's RSSI; PR #941 (EDCA after
+  a change of the slot time) has no measurements, upstream or here.
 - **mt76x2 gain control** (`ed62359`): the station RSSI average that the AGC uses is no longer the
   −75 dBm fallback.
 - **Range and stability of Wi-Fi:** `iwinfo <dev> txpowerlist` and the RSSI at a distance with PA and
@@ -211,19 +233,23 @@ sources*).
   2.4 GHz.
 - **WPA3:** the time of an SAE handshake (`logread`, a client connecting to the 5 GHz access
   point) and the CPU load while clients connect; a device with WPA2 only and a phone with WPA3 on
-  the mixed 5 GHz network.
+  the mixed 5 GHz network. On 2026-11-06 a phone moved by the router from 2.4 GHz to the 5 GHz
+  network (SAE only) at −82 dBm completed SAE, the 4-way handshake and DHCP within 1–2 s, with no
+  CPU to speak of. Forced moves of a phone with its screen off measure Android's scans (every
+  ~3.5 min) and its blocklist after a ban, not the router: repeat `tests/router/bandswitch.sh` with
+  the screen kept on.
 - **The flash clock checked at boot** (patch 951, 2026-11-06, [RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router)):
   both branches checked on the router with the debug image (96.7 MHz rejected, 64.4 MHz taken,
-  reads equal to those at 48.3 MHz). Left: the release image (`o2-fc2`), whose `dmesg` must show
-  64.4 MHz, and its boot measured as in the boot investigation; reports of other units (JEDEC ID
-  and SFDP CRC-32 from `dmesg | grep spi-nor`) to learn which chips pass.
+  reads equal to those at 48.3 MHz); the release image of 2026-11-06 took 64.4 MHz as well. Left:
+  its boot measured as in the boot investigation; reports of other units (JEDEC ID and SFDP CRC-32
+  from `dmesg | grep spi-nor`) to learn which chips pass.
 - **WISP with the second router:** throughput in both directions (in 2019 the C50 v4 as a 5 GHz
   client uploaded at 0.2–2 Mbit/s, [RESEARCH.md section 16](RESEARCH.md#16-the-openwrt-forum)); the
   upstream switched off and on (travelmate).
-- **A DFS channel on 5 GHz** (e.g. 52 or 100): the access point starts after the channel check;
-  on 19.07 only 36–48 and 149–165 worked ([RESEARCH.md section 16](RESEARCH.md#16-the-openwrt-forum)).
 - **WireGuard and AmneziaWG:** throughput with the router as a client of a VPS and as a full tunnel
-  for the LAN, AmneziaWG with and without obfuscation; no DNS leak in the full tunnel.
+  for the LAN, AmneziaWG with and without obfuscation; no DNS leak in the full tunnel. WireGuard in
+  states A and U done on 2026-11-06 with the router's own iperf3 (A 27.7 up / 23.1 down, U 29.8 /
+  24.7 Mbit/s); AmneziaWG on a release image, since the debug image leaves it out.
 - **Boot time** ([RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router)): the boot is bound by
   reading the flash, and odhcpd adds about 30 MiB of reads while the radios are set up. Candidates,
   each to be measured with the same reboots (`/proc/diskstats` of `mtdblock4`, WAN and AP times):
@@ -251,12 +277,7 @@ sources*).
 
 ## Open decisions
 
-- **IGMP snooping on `br-lan` as a default.** OpenWrt turns on multicast-to-unicast for access
-  points by default, but it only takes effect with IGMP snooping on the bridge (`igmp_snooping`
-  of the `br-lan` device, off by default; `CONFIG_BRIDGE_IGMP_SNOOPING` is in the kernel). Without
-  it an IPTV stream goes over the air as multicast at a basic rate. Test on the router with IPTV to
-  a Wi-Fi client and with ordinary LAN multicast (mDNS, SSDP); forum reports mention side effects.
-  `omcproxy` was considered for IPTV and left out: rarely used for it, its strength is IPv6.
+None at the moment (2026-11-06: IGMP snooping on `br-lan` went with IPTV).
 
 ## Space reserve
 
@@ -308,6 +329,16 @@ the table in AGENTS.md gets the link.
   HTTP/1.1. **A candidate, not prepared:** this build has HTTP/2 now
   ([RESEARCH.md section 14](RESEARCH.md#14-encrypted-dns-doh)).
 
+- **base-files and libubox: the GRO default of `board.json`** → openwrt/openwrt and
+  openwrt/libubox. `ucidef_set_network_device_gro` (`01d675687c`, 2023) writes `"gro": "0"`, a
+  string, and netifd's `config_get_default_gro()` takes only a boolean, so the helper does nothing;
+  and `json_load` of jshn turns a `-` in a key into `_`, so an entry for `phy0-ap0` does not
+  survive a later `board.d` script (`99-default_network` always runs last). Both shown on the QEMU
+  bench on 2026-11-06 ([RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router)); no board of
+  the tree calls the helper. **A candidate, not prepared:** the build uses device sections
+  instead. The first fix is one line (`json_add_boolean`); the second needs jshn to keep the
+  original key on load.
+
 ## When upstream merges
 
 Each patch the fork carries gets an item here: what it waits for, and when to drop it.
@@ -321,6 +352,8 @@ Each patch the fork carries gets an item here: what it waits for, and when to dr
 - **https-dns-proxy: the backup of an empty dnsmasq server list** (`feeds-patches/packages/0001-*.patch`):
   submit to openwrt/packages ([AGENTS.md](AGENTS.md#upstream-contributions)); drop it once the feed
   tests that the backup exists.
+- **The open pull requests of openwrt/mt76** (`0323` #1166, `0324` #941, `0325` #1136, taken on
+  2026-11-06): drop each one when mt76 has it, or adapt it to the version that is merged.
 - **The 22 mt76 commits** (`0300`–`0321`): drop each one that the mt76 of a new OpenWrt release contains
   ([UPGRADING.md section 2.2](UPGRADING.md#22-merge-the-new-tag)).
 - **GCC 15.3.0** (three commits of OpenWrt main, [UPGRADING.md section 1.1](UPGRADING.md#11-this-builds-commits)):
@@ -328,6 +361,37 @@ Each patch the fork carries gets an item here: what it waits for, and when to dr
 
 ## Deferred
 
+Postponed by the owner on 2026-11-07, with PPPoE on the router (the bench covers it):
+
+- **mt7603 hangs when the 2.4 GHz radio is reconfigured under load** (the deadlock fix `0323` is in the build) (seen on 2026-11-03, a serious
+  bug): `htmode` HT20 → HT40 and `wifi up radio0` while a download with many TCP flows kept the
+  channel 88 % busy. At the teardown of `phy0-ap0` the firmware did not answer `MCU message 08`
+  (`MCU_EXT_CMD_CHANNEL_SWITCH`),
+  hostapd stayed in `D` in `sendmsg` with `iw` and the `ipv6_addrconf` kworker behind it, the
+  2.4 GHz network was gone (5 GHz and wired kept forwarding), and only a reboot brought it back.
+  With the download paused the same `wifi up radio0` passed twice (HT40, HT40 with `noscan`), and
+  so did the switch back HT40 → HT20 under load (26 Mbit/s): load seems needed, but does not always
+  cause it. Find out how often it happens (repeated switches under load, both directions), whether
+  other changes do it (channel, TX power, `wifi reload`), whether the 22 backported commits or the
+  sensitivity fix play a part (an image without them), and what holds the locks: a dev build with
+  `KALLSYMS` and debugfs
+  (`/proc/<pid>/stack`, `echo w > /proc/sysrq-trigger`). Then a fix or a report to openwrt/mt76.
+  On the debug image (2026-11-05, `tests/router/hangload.sh`): 27 switches, 15 idle and 12 under a
+  UDP stream of 20–45 Mbit/s, without a hang. Left: TCP with many flows to a client and
+  the release kernel. On 2026-11-06 one switch under a phone's TCP download (42 Mbit/s, 4 flows)
+  passed (`tests/router/hangtcp.sh`), but the phone's iperf3 does not survive the reconnect, so
+  the TCP case needs a client that keeps its flows, e.g. a PC with a torrent. **A likely cause,
+  found on 2026-11-06:** when a channel switch fails (the MCU timeout of message 08),
+  `mt7603_set_channel()` calls `mt7603_mac_work()` directly, which takes `dev->mutex` that
+  `mt76_set_channel()` already holds: the driver deadlocks, as seen here (hostapd in `D`).
+  openwrt/mt76 PR #1166 (a draft, MT7628 on a TL-MR3420 v5) queues the work instead; our mt76
+  has the same code. Taken as `0323` (2026-11-06); the MCU timeout itself stays, but the watchdog
+  can then recover. Repeat `hangtcp.sh` with a client that keeps its flows. The OpenWrt forum reports 2.4 GHz stopping under heavy traffic until a reboot on
+  21.02 and 22.03, without a reconfiguration ([RESEARCH.md section 16](RESEARCH.md#16-the-openwrt-forum)).
+- **A DFS channel on 5 GHz** (e.g. 52 or 100): the access point starts after the channel check;
+  on 19.07 only 36–48 and 149–165 worked ([RESEARCH.md section 16](RESEARCH.md#16-the-openwrt-forum)).
+  Channel 52 of the test router does not count: the rules of the country set on it need no radar
+  check there. Set a country whose rules need one; the 5 GHz network has no clients at the site.
 - **LTO.** −5 KiB without MIPS16, breaks shared libraries with it. Not worth it.
 - **Firmware updates from LuCI** as in openwrt-ax3200. They need an HTTPS client, certificates
   and `mbedtls`, which this build leaves out ([RESEARCH.md section 2](RESEARCH.md#2-size-of-the-programs)).
@@ -345,6 +409,10 @@ Each patch the fork carries gets an item here: what it waits for, and when to dr
     `/tmp`), in QEMU with `-m 64` and on the router.
   - Leave zram out if `MemAvailable` stays at about 16 MB or more at the peak without bursts of
     major faults; otherwise add it with the compressor that costs less CPU (lz4 or lzo-rle).
+- **IPTV** (left out on 2026-11-06, [RESEARCH.md section 8](RESEARCH.md#8-routing-acceleration-and-iptv)):
+  `igmpproxy`, `udpxy` with `luci-app-udpxy` and the multicast routing of the kernel come back if
+  users ask for them; they cost 64 KiB of the image (41 KiB of `root.squashfs`, 16 KiB of
+  the kernel in flash) and 55 KiB of kernel RAM. The bench still has their checks.
 - **Beamforming on the MT7612E.** The chip supports it, the mt76x2 driver does not implement it.
   A project of its own without documentation; not planned.
 

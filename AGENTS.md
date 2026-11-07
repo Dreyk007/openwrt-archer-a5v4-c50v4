@@ -53,7 +53,9 @@ core, no hardware NAT and no package manager in the image.
   snippet with the bench's helpers instead of the tests, for debugging). A new feature gets its
   check in the bench. QEMU cannot show speed (TCG
   emulation), the radios, the switch or the flash layout; those are tested on the router. The
-  checks are listed in `TODO.md`.
+  checks are listed in `TODO.md`. Nor the order of the boot for `eth0`: on malta it comes from a
+  module (`pcnet32`) after procd starts, on the router from a built-in driver before, so a hotplug
+  script for `eth0` runs on the bench and never on the router; set such things from an init script.
 - On QEMU's malta the first `-nic` is the onboard card (PCI slot `0x0b`) and becomes `eth0`; the
   bench passes the LAN card first. The `--qemu` and router builds share one tree: `build.sh`
   rewrites `.config` from the seed every time.
@@ -122,7 +124,8 @@ carries LuCI in Russian and English).
   which follow with the first release.
 - The firmware is published on GitHub and in the 4pda thread of the Archer A5: users install it
   from the stock firmware, without a package manager afterwards. Spell out what the build leaves
-  out and what each setup (WISP, WireGuard, IPTV) needs.
+  out and what each setup (WISP, WireGuard) needs; IPTV over multicast is not supported (`RESEARCH.md`
+  section 8).
 - UI texts: say what happens and what it costs, with measured numbers where there are some.
 - Code comments are in English only.
 

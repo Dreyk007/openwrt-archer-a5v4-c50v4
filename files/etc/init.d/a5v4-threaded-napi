@@ -1,0 +1,25 @@
+#!/bin/sh /etc/rc.common
+#
+# Threaded NAPI on eth0, a default of the Archer A5 v4 / C50 v4 build (RESEARCH.md section 12).
+#
+# The receive work of the Ethernet driver then runs in a kernel thread (napi/eth0-*) that the
+# scheduler shares with the processes, instead of in softirq context, where a download at line rate
+# from the LAN to Wi-Fi kept hostapd, dnsmasq, netifd and dropbear from the CPU for a second at a
+# time (ten without GRO, which the kernel of the build leaves off on every interface). Throughput
+# and CPU per Mbit/s stay the same. netifd has no option for it. The driver of eth0 is built into
+# the kernel and creates eth0 before procd starts, so no hotplug event announces it: the setting
+# is written at every boot, after the boot script has loaded the modules.
+#
+# Off: uci set a5v4.network=network; uci set a5v4.network.threaded_napi=0; uci commit a5v4;
+# /etc/init.d/a5v4-threaded-napi start
+
+START=11
+
+start() {
+	[ -w /sys/class/net/eth0/threaded ] || return 0
+	if [ "$(uci -q get a5v4.network.threaded_napi)" = 0 ]; then
+		echo 0 > /sys/class/net/eth0/threaded
+	else
+		echo 1 > /sys/class/net/eth0/threaded
+	fi
+}

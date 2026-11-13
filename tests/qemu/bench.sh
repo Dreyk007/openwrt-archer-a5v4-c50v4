@@ -268,6 +268,8 @@ t_router_wifi_drivers() { r 'lsmod' | grep -q '^mt7603e' && r 'lsmod' | grep -q 
 # The delay interrupts of both radios by default (mt76 patches 0326 and 0327: delay_int 0x9032880a)
 t_mt76_delay_int() { [ "$(r 'cat /sys/module/mt76x02_lib/parameters/delay_int')" = 2419230730 ] &&
     [ "$(r 'cat /sys/module/mt7603e/parameters/delay_int')" = 2419230730 ]; }
+# The 5 GHz TX optimization switches by default (mt76 patches 0328-0331: tx_opt 0xf)
+t_mt76_tx_opt() { [ "$(r 'cat /sys/module/mt76x02_lib/parameters/tx_opt')" = 15 ]; }
 # GRO off on every network device by the kernel of the build (hack patch 601), without any
 # configuration, and threaded NAPI on eth0 (/etc/init.d/a5v4-threaded-napi; on malta eth0 comes
 # from a module, on the router from a built-in driver); netifd's device status reads the GRO flag
@@ -674,6 +676,7 @@ fi
 if r 'ls /lib/modules/*/mt7603e.ko' >/dev/null 2>&1; then
     check "router Wi-Fi drivers load (mt7603e, mt76x2e)" t_router_wifi_drivers
     check "mt76x02 and mt7603: delay interrupts by default (delay_int)" t_mt76_delay_int
+    check "mt76x02: 5 GHz TX optimization switches by default (tx_opt)" t_mt76_tx_opt
 else
     skip "router Wi-Fi drivers load" "the image has no mt7603e"
 fi

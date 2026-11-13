@@ -59,6 +59,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         udhcpc \
         util-linux \
         wireguard-tools \
+        xl2tpd \
     && rm -rf /var/lib/apt/lists/*
 
 # OpenWrt refuses to build as root: builds run as this user, whose IDs match the owner of the

@@ -11,8 +11,8 @@
 #   router (QEMU malta, 24KEc, 64 MiB)
 #     LAN eth0 192.168.1.1 -- br-lan0 -- namespace "lan": client 192.168.1.10 (+ DHCP test)
 #     WAN eth1             -- br-wan0 -- namespace "wan": the ISP 192.0.2.1 (DHCP, DNS, PPPoE
-#                                         10.64.0.1, WireGuard 10.99.0.1) and an internet host
-#                                         198.18.0.1 (iperf3)
+#                                         10.64.0.1, L2TP 10.65.0.1, WireGuard 10.99.0.1) and an
+#                                         internet host 198.18.0.1 (iperf3)
 #
 # The internet host lives in 198.18.0.0/15 (RFC 2544) under an ordinary domain: dnsmasq treats
 # the documentation ranges of RFC 5737 as private (the DNS rebind protection of OpenWrt drops
@@ -161,6 +161,46 @@ if [ -c /dev/ppp ] && command -v pppoe-server >/dev/null; then
     if nsx wan pppoe-server -I eth0 -L 10.64.0.1 -R 10.64.0.10 -N 4 -O "$W/pppoe-server-options" \
             -X "$W/pppoe-server.pid" 2> "$W/pppoe-server.log"; then
         PPPOE_OK=1
+    fi
+fi
+
+# L2TP LNS of the ISP (pppd needs /dev/ppp, passed by docker/run.sh --bench)
+L2TP_OK=0
+if [ -c /dev/ppp ] && command -v xl2tpd >/dev/null; then
+    mkdir -p /etc/ppp
+    printf '"bench" * "bench" *\n' > /etc/ppp/pap-secrets
+    printf '"bench" * "bench" *\n' > /etc/ppp/chap-secrets
+    cat <<EOF > "$W/xl2tpd-wan.options"
+require-pap
+refuse-chap
+refuse-mschap
+refuse-mschap-v2
+refuse-eap
+lcp-echo-interval 5
+lcp-echo-failure 3
+ms-dns 192.0.2.1
+mtu 1400
+mru 1400
+EOF
+    cat <<EOF > "$W/xl2tpd-wan.conf"
+[global]
+listen-addr = 192.0.2.1
+[lns default]
+ip range = 10.65.0.10-10.65.0.20
+local ip = 10.65.0.1
+require pap = yes
+require chap = no
+refuse chap = yes
+require authentication = yes
+pppoptfile = $W/xl2tpd-wan.options
+EOF
+    : > "$W/xl2tpd-wan.secrets"
+    nsx wan xl2tpd -c "$W/xl2tpd-wan.conf" -s "$W/xl2tpd-wan.secrets" \
+        -p "$W/xl2tpd-wan.pid" -C "$W/xl2tpd-wan.ctl" -D > "$W/xl2tpd-wan.log" 2>&1 &
+    L2TP_PID=$!
+    sleep 0.5
+    if kill -0 "$L2TP_PID" 2>/dev/null; then
+        L2TP_OK=1
     fi
 fi
 
@@ -513,6 +553,42 @@ wan_pppoe() {
 pppoe_addr() { r 'ubus call network.interface.wan status' | grep -q '"address": "10\.64\.0\.'; }
 t_pppoe_up() { wait_for 90 pppoe_addr; }
 
+# --- L2TP (on top of the DHCP WAN)
+l2tp_addr() { r 'ubus call network.interface.l2tp status' 2>/dev/null | grep -q '"address": "10\.65\.0\.'; }
+l2tp_gone() { ! l2tp_addr; }
+l2tp_uci_add() {
+    r "uci set network.l2tp=interface; uci set network.l2tp.proto=l2tp
+       uci set network.l2tp.server=192.0.2.1; uci set network.l2tp.username=bench
+       uci set network.l2tp.password=bench
+       for z in \$(uci show firewall | sed -n \"s/^firewall\\.\\([^.]*\\)\\.name='wan'\$/\\1/p\"); do
+           uci add_list firewall.\$z.network=l2tp
+       done
+       uci commit; sync
+       ${1:+/etc/init.d/network reload; fw4 -q reload}" >/dev/null
+}
+l2tp_uci_del() {
+    r "uci -q delete network.l2tp
+       for z in \$(uci show firewall | sed -n \"s/^firewall\\.\\([^.]*\\)\\.name='wan'\$/\\1/p\"); do
+           uci -q del_list firewall.\$z.network=l2tp
+       done
+       uci commit; /etc/init.d/network reload; fw4 -q reload" >/dev/null
+    wait_for 60 t_wan_dhcp || true
+}
+t_l2tp_idle() {
+    ! r 'pidof xl2tpd' >/dev/null 2>&1 || { echo "xl2tpd is running at idle"; return 1; }
+    ! mod_loaded l2tp_ppp && ! mod_loaded l2tp_core || { echo "l2tp module loaded at idle"; return 1; }
+}
+t_l2tp_up() {
+    wait_for 90 l2tp_addr || { r 'logread | tail -n 20'; return 1; }
+    mod_loaded l2tp_ppp && mod_loaded l2tp_core || { echo "l2tp kernel modules missing"; r 'lsmod'; return 1; }
+    r 'logread' | grep -q 'Using l2tp kernel support\.' || { echo "xl2tpd did not report kernel support"; r 'logread | grep xl2tpd | tail -n 10'; return 1; }
+    r 'ping -c 3 -W 2 -I l2tp-l2tp 10.65.0.1'
+}
+t_l2tp_down() {
+    r 'ifdown l2tp' >/dev/null
+    wait_for 30 l2tp_gone || { r 'ubus call network.interface.l2tp status'; return 1; }
+}
+
 # --- WireGuard (remote access to the router through a tunnel with a host on the WAN side)
 wg_handshake() { nsx wan wg show wg0 latest-handshakes | awk '$2 > 0' | grep -q .; }
 t_wg_handshake() { wait_for 60 wg_handshake; }
@@ -748,6 +824,24 @@ else
     skip "PPPoE" "no pppoe-server on the WAN side ($(tr '\n' ' ' < "$W/pppoe-server.log" 2>/dev/null))"
 fi
 
+section "L2TP"
+if ! has xl2tpd; then
+    skip "L2TP" "the image has no xl2tpd"
+elif [ "$L2TP_OK" != 1 ]; then
+    check "L2TP LNS on the bench host" false
+else
+    check "L2TP idle: no xl2tpd process and no l2tp modules at boot" t_l2tp_idle
+    info "memory at L2TP idle: $(r "grep -E 'MemAvailable' /proc/meminfo" | tr -s ' ')"
+    l2tp_uci_add reload
+    check "L2TP up (10.65.0.x, kernel modules, kernel support log, ping 10.65.0.1)" t_l2tp_up
+    info "memory of xl2tpd: $(r 'for p in $(pidof xl2tpd); do
+        printf "%s/%s kB; " "$(sed -n "s/^RssAnon:[[:space:]]*\([0-9]*\).*/\1/p" /proc/$p/status)" "$(sed -n "s/^VmRSS:[[:space:]]*\([0-9]*\).*/\1/p" /proc/$p/status)"
+    done') (private/resident)"
+    info "memory with L2TP up: $(r "grep -E 'MemAvailable' /proc/meminfo" | tr -s ' ')"
+    check "L2TP down: address gone after ifdown l2tp" t_l2tp_down
+    l2tp_uci_del
+fi
+
 section "WireGuard"
 if ! has wg; then
     skip "WireGuard" "the image has no wireguard-tools"
@@ -903,11 +997,22 @@ r "uci set system.@system[0].hostname=benchrouter; uci commit system; sync" >/de
 if [ "$NETDEF" = yes ]; then
     r "s=\$(uci add network device); uci set network.\$s.name='$WANDEV'; uci set network.\$s.gro=1; uci commit network; sync" >/dev/null
 fi
+if has xl2tpd && [ "$L2TP_OK" = 1 ]; then
+    l2tp_uci_add
+fi
 r 'reboot' >/dev/null 2>&1 || true
 ssh_down() { ! r true; }
 wait_for 120 ssh_down || true
 BOOT2_SECS="$(wait_ssh)"
 info "second boot to SSH: $BOOT2_SECS s"
+if has xl2tpd && [ "$L2TP_OK" = 1 ]; then
+    L2TP_BOOT_T0="$(date +%s)"
+    wait_for 90 l2tp_addr >/dev/null 2>&1 || true
+    L2TP_BOOT_SECS=$(( $(date +%s) - L2TP_BOOT_T0 ))
+    info "L2TP address after reboot: $L2TP_BOOT_SECS s from SSH"
+    check "L2TP at boot (10.65.0.x, kernel modules, kernel support log, ping 10.65.0.1)" t_l2tp_up
+    l2tp_uci_del
+fi
 t_persist() { [ "$(r 'uci get system.@system[0].hostname')" = benchrouter ]; }
 check "settings survive a reboot (overlay)" t_persist
 check "no kernel Oops, BUG or panic after the reboot" t_kernel_clean

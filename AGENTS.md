@@ -59,6 +59,14 @@ core, no hardware NAT and no package manager in the image.
 - On QEMU's malta the first `-nic` is the onboard card (PCI slot `0x0b`) and becomes `eth0`; the
   bench passes the LAN card first. The `--qemu` and router builds share one tree: `build.sh`
   rewrites `.config` from the seed every time.
+- They also share `staging_dir/target-mipsel_24kc_musl`, so the mac80211 headers come from the last
+  build. A router build whose debugfs setting differs from the last build's (`--dev` after a QEMU or
+  release build, or the reverse) compiles mt76 against the wrong `struct` layout, and the radios do
+  not probe (`-ENOMEM`; the debug image T1-b, 2026-11-07). Before a router build, check that
+  `CPTCFG_MAC80211_DEBUGFS` in
+  `staging_dir/target-mipsel_24kc_musl/usr/include/mac80211-backport/backport/autoconf.h` is defined
+  for `--dev` and absent otherwise; if it is not, remove
+  `build_dir/target-mipsel_24kc_musl/linux-ramips_mt76x8/mac80211-regular` and `…/mt76-*` first.
 - A single package: `make package/<name>/compile` after `make defconfig` with the package
   selected. LuCI apps build through `feeds/luci/luci.mk`, so the feeds must be installed.
 - The image has no package manager, so a package cannot be installed on the router. To test one
@@ -89,6 +97,16 @@ core, no hardware NAT and no package manager in the image.
   them without a new image, build them with the toolchain of the tree in the container:
   `export STAGING_DIR=$PWD/staging_dir; staging_dir/toolchain-mipsel_24kc_gcc-*_musl/bin/mipsel-openwrt-linux-musl-gcc
   -O2 -march=24kec -s -o tmp/kprof tests/router/kprof.c`.
+- **The 5 GHz TX path** (`RESEARCH.md` section 12) was measured with a debug series kept in
+  `tests/mt76-debug`: the versions of `0328`–`0331` with debugfs switches on `phy1`
+  (`tx_skip_idle`, `tx_no_reread`, `tx_skip_complete_stat`, `tx_skip_napi_stat`), `0332`
+  (`tx_wb_mode`, dropped) and the counters of `0399` (`mt76/tx_reads`). For such an image remove
+  `package/kernel/mt76/patches/0328-*` … `0331-*`, copy `tests/mt76-debug/*.patch` there and build
+  with `--dev`; never commit or release that state. With it: `autolab.sh` (A/B sessions by the
+  switches, with `iperf-phone-auto.sh` and `iperf3-server.cmd` as clients), `run24.sh` (a 24-hour
+  guard that turns the switches off on a problem), `csa_round.sh` (a channel switch under load) and,
+  on the host, `irqsum.py` (a summary with the spread rule). The phone's address is a parameter
+  (`PMAC`); keep site data out of the repository.
 - The Ethernet ports are 100 Mbit/s: wired throughput tests only show the CPU load at line rate.
   The CPU-bound paths are Wi-Fi ↔ Wi-Fi, Wi-Fi client (WISP) ↔ LAN and WireGuard.
 - If the agent reaches the router over Wi-Fi, start commands that restart Wi-Fi detached on the
@@ -160,6 +178,7 @@ Waiting upstream (update this list when one is merged or closed, and drop the fo
 | mt7603: let the dynamic sensitivity start from 0 (own fix, `RESEARCH.md` section 6) | not yet: submit to openwrt/mt76 after the test on the router |
 | ramips: rt3050-esw: keep the WAN port disabled until it is configured (`RESEARCH.md` section 1) | not yet: checked on the router, to submit to openwrt/openwrt |
 | https-dns-proxy: keep the backup of an empty dnsmasq server list (`feeds-patches/packages/0001-*.patch`, `RESEARCH.md` section 14) | not yet: submit to openwrt/packages |
+| mt76x02: fewer register reads in the 5 GHz TX path (`0328`–`0331`, `RESEARCH.md` section 12) | not yet: `0328` first, to openwrt/mt76 (`TODO.md`, To submit upstream) |
 
 ## Working with the owner
 

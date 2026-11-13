@@ -48,6 +48,10 @@ The plan decided on 2026-11-01. In this order; every step records its size cost
   [RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router)): GRO off on every network device by
   the kernel (`target/linux/generic/hack-6.12/601-…`), threaded NAPI from
   `files/etc/init.d/a5v4-threaded-napi`; the QEMU bench checks both.
+- 5 GHz TX cleanup and status polling optimizations (`package/kernel/mt76/patches/0328`–`0331`,
+  `tx_opt=15` by default on `mt76x02_lib`, decided on 2026-11-11 after site A/B, 24 h run, and CSA
+  checks, [RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router)); QEMU bench checks
+  `tx_opt=15`.
 
 1. **The router.** A full dump of all partitions before the first flash (`radio` and `rom` are
     unique to the unit), then `sysupgrade` (`-f` with a configuration tested in QEMU keeps the
@@ -160,22 +164,38 @@ sources*).
   the site. Then the boot with a series of reboots (the boot item below). Done on 2026-11-06: GRO
   off everywhere, WireGuard the same with GRO off on `wg0`, threaded NAPI at boot from the init
   script (the debug image `o2-dev-irq`).
-- **mt76x02 reads MT7612E registers over PCIe for every frame** (2026-11-05; handed to other
-  developers as tasks on 2026-11-07, the agent reviews their results): `mt76_dma_tx_cleanup`
-  and `mt76_mmio_rr` take about a quarter of the CPU of a 90 Mbit/s download on 5 GHz: the DMA
-  index of each TX queue on every cleanup, two words of the TX status FIFO per frame. Candidates:
-  fewer reads (skip idle queues, read the status FIFO in batches or only for the frames that rate
-  control samples), and the delay interrupts of `MT_WPDMA_DELAY_INT_CFG` for RX and TX in place of
-  the per-frame ones (TX is configured but unused, RESEARCH.md section 12; the interrupt handler
-  must then acknowledge the raw status, as openwrt/mt76 PR #1138 does); measure each with
-  `labtest.sh`, then offer upstream (openwrt/mt76). The delay interrupts are in `0326` (`delay_int`
-  of `mt76x02_lib`, applied at `wifi up`, off by default) and work (2026-11-06); left: their effect
-  with a 5 GHz client. The phone did not come back after the restart of the radio that applies them
-  (2026-11-07). Measured with a phone reconnected by hand (2026-11-07): a third fewer interrupts,
-  the same throughput and CPU in UDP from the router and LAN ↔ 5 GHz (RESEARCH.md section 12); on by
-  default since then, the owner's choice, to watch it in use (latency on 5 GHz, MCU timeouts or
-  stalls in `logread`, the watchdog of mt76x02). The reads over PCIe in the TX cleanup remain the
-  candidate for CPU.
+- **mt76x02 delay interrupts and PCIe register reads in TX cleanup** (2026-11-05; implemented and
+  tested on 2026-11-06…12, [RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router)):
+  `delay_int` (`0326`, on by default since 2026-11-07; continue watching 5 GHz latency, MCU
+  timeouts/stalls in `logread`, and the mt76x02 watchdog) and the 5 GHz TX optimizations
+  (`0328`–`0331`, shipped on by default behind `mt76x02_lib` `tx_opt=0xf` / `15` after site A/B
+  tests showing +10.0 % 5 GHz UDP and +6.3 % concurrent 2.4 GHz download in `S-ALL` State `F`
+  — where `0332` / `tx_wb_mode=2` was also active and showed no gain of its own in `S-T3` —
+  +1.7 pp TCP DL idle, 24.58 h household run with −41 % status polls and 0 hangs/timeouts in
+  dmesg, and `F A F A` CSA checks with 4 switches on and 4 off finishing in 1.83–2.02 s; `0332`
+  active TX write-back dropped for zero gain within spread). Still untested with `0328`–`0331` on: a **second 5 GHz client** concurrently
+  active on `phy1-ap0` (hardware TX status FIFO pressure under `0331`), **`mt76x2e` TX hang
+  watchdog recovery** (`tx_hang_reset` stayed 0 throughout all runs), and the **power-save burst
+  trace** on a sleeping phone (ran in baseline `A` only).
+- **Frames for a client in power save** (2026-11-07, found by a `kfree_skb` trace on the debug
+  image).
+  - **What happens.** While a client dozes, mac80211 keeps at most 64 frames per access category
+    for it (`STA_MAX_TX_BUFFER`; 512 for the radio, `TOTAL_MAX_TX_BUFFER`). It drops the oldest
+    beyond that, and no counter shows it: `ieee80211_tx_h_unicast_ps_buf`, seen in the trace as
+    `ieee80211_tx_dequeue+0x2214`.
+  - **Measured.** UDP bursts from the router to a dozing phone lost the frames of the first
+    50–110 ms until the phone woke: up to about 690 frames per 1 s burst at 3,200 frames/s. The
+    trace count matched the loss of each burst within a few frames.
+  - **Open.** This is upstream's default. Whether real traffic hits it is unknown: TCP starts with
+    about 10 segments.
+  - **Next.** With the TCP tests at the site (a download after a pause, video, a speed test),
+    count these drops with the same trace. Only if they matter, try a larger buffer behind a
+    switch and compare. Count its RAM against the 64 MB.
+- **Large losses in continuous UDP runs to a dozing phone** (2026-11-07, T2 and T4, not
+  explained). Some 20 s runs from the router lost thousands of datagrams before the driver with no
+  counter (8,691 and about 18,900 in T2, 2,700–3,900 in T4), in both states of the switches. The
+  traced runs had no such loss. Next: the same `kfree_skb` trace over a run that loses (a weak
+  phone in power save, 20 s at the full rate) to see whether it is the power-save buffer above.
 - **Interrupt moderation of `eth0`** (2026-11-06, RESEARCH.md section 8): the `ralink` driver turns
   the delay interrupt of the frame engine off, the mainline `mtk_eth_soc` moderates it with net DIM
   on the MT7628. First, without a new image, `napi_defer_hard_irqs` and `gro_flush_timeout` of
@@ -322,6 +342,21 @@ the table in AGENTS.md gets the link.
   ([RESEARCH.md section 6](RESEARCH.md#6-wi-fi-driver-fixes-from-mt76-master)). **Not ready:** it
   needs the test on the router with a dev build that has debugfs (`Sensitivity:` moving on a busy
   channel, A/B of the channel busy time and the ping loss) first.
+- **mt76x02: optimize 5 GHz TX cleanup and status polling (`0328`–`0331`)** → openwrt/mt76
+  ([RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router)): submit **`0328`** (`mt76x02`:
+  skip `mt76_queue_tx_cleanup()` in `mt76x02_clean_tx_queue()` for idle TX queues) first as the
+  simplest, highest-yield change (~95 % of T2 savings: ~5.1 % CPU bus wait in download, ~40,000
+  PCIe reads/s), then `0329`–`0331` with the site measurements. Upstream will expect either a
+  module-prefixed variable (`module_param_named(tx_opt, mt76x02_tx_opt, uint, 0644)`) instead of
+  the plain global symbol `tx_opt` or no module parameter at all, and noting that only `mt76x2e`
+  was tested — not `mt76x0` or USB `mt76x02u` — with one 5 GHz client.
+- **mt76: warnings when the modules are unloaded** → openwrt/mt76 (a report, found 2026-11-08 while
+  modules were swapped on the debug image). `rmmod` of `mt76x2e` and `mt7603e` gives
+  `WARNING … at net/core/dev.h:159 page_pool_disable_direct_recycling` from `mt76_dma_cleanup()` →
+  `page_pool_destroy()` (four times, stock code), and the next `wifi up` with the reloaded modules
+  gave `WARNING … at kernel/softirq.c:781 tasklet_clear_sched` ("tasklet SCHED state not set: func
+  0x0"): a tasklet of the removed driver was still scheduled. Normal use never unloads them;
+  reproduce on a clean debug image (`rmmod mt76x2e`) before the report.
 - **https_dns_proxy (the program): log the missing HTTP/2 once** → aarond10/https_dns_proxy.
   With a libcurl without HTTP/2 every request logs `Setting HTTP/2 version failed`
   (`https_set_request_version()` in `src/https_client.c`; 399 lines in the first hour on the
@@ -356,6 +391,8 @@ Each patch the fork carries gets an item here: what it waits for, and when to dr
   2026-11-06): drop each one when mt76 has it, or adapt it to the version that is merged.
 - **The 22 mt76 commits** (`0300`–`0321`): drop each one that the mt76 of a new OpenWrt release contains
   ([UPGRADING.md section 2.2](UPGRADING.md#22-merge-the-new-tag)).
+- **The 5 GHz TX optimizations** (`0328`–`0331`): drop each one when upstream mt76 merges it, or
+  adapt the remaining patches and `tx_opt` bits around what was merged.
 - **GCC 15.3.0** (three commits of OpenWrt main, [UPGRADING.md section 1.1](UPGRADING.md#11-this-builds-commits)):
   drop them once the series builds 15.3.0 or newer by default.
 
@@ -390,8 +427,12 @@ Postponed by the owner on 2026-11-07, with PPPoE on the router (the bench covers
   21.02 and 22.03, without a reconfiguration ([RESEARCH.md section 16](RESEARCH.md#16-the-openwrt-forum)).
 - **A DFS channel on 5 GHz** (e.g. 52 or 100): the access point starts after the channel check;
   on 19.07 only 36–48 and 149–165 worked ([RESEARCH.md section 16](RESEARCH.md#16-the-openwrt-forum)).
-  Channel 52 of the test router does not count: the rules of the country set on it need no radar
-  check there. Set a country whose rules need one; the 5 GHz network has no clients at the site.
+  Channel 52 of the test router does not count: the first-boot country `PA` gives it no DFS flag
+  (no CAC, no radar detection; RESEARCH.md section 12). Set a country whose rules need one (an ETSI country:
+  DFS on 52–64 and 100–140, often 20 dBm on both bands instead of the 22 the radios run at) and
+  measure: the 60 s CAC at each start, the CPU of the radar detector (a GP timer interrupt every
+  10.24 ms), false detections over a day, and the clients after a switch (the test phone does not
+  follow a CSA: dropped for missing ACKs 7–8 s after each switch, back after 17–138 s).
 - **LTO.** −5 KiB without MIPS16, breaks shared libraries with it. Not worth it.
 - **Firmware updates from LuCI** as in openwrt-ax3200. They need an HTTPS client, certificates
   and `mbedtls`, which this build leaves out ([RESEARCH.md section 2](RESEARCH.md#2-size-of-the-programs)).

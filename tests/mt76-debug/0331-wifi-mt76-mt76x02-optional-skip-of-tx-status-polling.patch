@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Sat, 7 Nov 2026 19:40:43 +0200
+Subject: [PATCH] wifi: mt76: mt76x02: optional skip of tx status polling in
+ napi
+
+In mt76x02_poll_tx(), the driver calls mt76x02_mac_poll_tx_status() at the
+start of each TX NAPI poll cycle. Each poll issues two 32-bit PCIe reads
+(MT_TX_STAT_FIFO_EXT and MT_TX_STAT_FIFO), taking ~2.7 us per poll.
+
+During a 22.6 s UDP burst, NAPI executes 50,608 polls, virtually all of
+which find an empty hardware FIFO because hardware interrupt MT_INT_TX_STAT
+already drains valid status entries into dev->txstatus_fifo, and the TX
+worker drains both the hardware FIFO and the software FIFO.
+
+Add a run-time debugfs switch tx_skip_napi_stat (/sys/kernel/debug/
+ieee80211/phy1/mt76/tx_skip_napi_stat, default 0). When enabled,
+mt76x02_poll_tx() skips polling the hardware status FIFO. Status entries
+continue to be retrieved via the MT_INT_TX_STAT hard interrupt and processed
+by the TX worker.
+
+This eliminates ~50,600 redundant FIFO polls (~101,200 PCIe reads, ~137 ms
+CPU time per 22.6 s run).
+---
+ mt76x02.h         | 1 +
+ mt76x02_debugfs.c | 2 ++
+ mt76x02_mmio.c    | 3 ++-
+ 3 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/mt76x02.h b/mt76x02.h
+index ae2246bc..33f8bc72 100644
+--- a/mt76x02.h
++++ b/mt76x02.h
+@@ -132,6 +132,7 @@ struct mt76x02_dev {
+ 	bool enable_tpc;
+ 	bool tx_skip_idle;
+ 	bool tx_skip_complete_stat;
++	bool tx_skip_napi_stat;
+ 
+ 	bool no_2ghz;
+ 
+diff --git a/mt76x02_debugfs.c b/mt76x02_debugfs.c
+index 670d4d01..b3658f59 100644
+--- a/mt76x02_debugfs.c
++++ b/mt76x02_debugfs.c
+@@ -145,6 +145,8 @@ void mt76x02_init_debugfs(struct mt76x02_dev *dev)
+ 	debugfs_create_bool("tx_no_reread", 0600, dir, &dev->mt76.tx_no_reread);
+ 	debugfs_create_bool("tx_skip_complete_stat", 0600, dir,
+ 			    &dev->tx_skip_complete_stat);
++	debugfs_create_bool("tx_skip_napi_stat", 0600, dir,
++			    &dev->tx_skip_napi_stat);
+ 
+ 	debugfs_create_file("edcca", 0600, dir, dev, &fops_edcca);
+ 	debugfs_create_file("ampdu_stat", 0400, dir, dev, &mt76x02_ampdu_stat_fops);
+diff --git a/mt76x02_mmio.c b/mt76x02_mmio.c
+index a0aac1a5..e0906ab2 100644
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -194,7 +194,8 @@ static int mt76x02_poll_tx(struct napi_struct *napi, int budget)
+ 					       mt76.tx_napi);
+ 	int i;
+ 
+-	mt76x02_mac_poll_tx_status(dev, false);
++	if (!READ_ONCE(dev->tx_skip_napi_stat))
++		mt76x02_mac_poll_tx_status(dev, false);
+ 
+ 	mt76x02_clean_tx_queue(dev, dev->mt76.q_mcu[MT_MCUQ_WM]);
+ 	for (i = MT_TXQ_PSD; i >= 0; i--)

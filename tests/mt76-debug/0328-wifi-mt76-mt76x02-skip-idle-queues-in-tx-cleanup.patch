@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Sat, 7 Nov 2026 05:36:43 +0200
+Subject: [PATCH] wifi: mt76: mt76x02: skip idle queues in tx cleanup
+
+During 5 GHz TX NAPI polling on MT7612E, mt76x02_poll_tx() cleans the MCU
+ring and data queues MT_TXQ_PSD..0 twice per poll (before and after
+napi_complete_done). In normal operation over 93% of these queue scans
+find an empty queue (q->queued == 0), yet each scan executes a PCIe MMIO
+read of the hardware DMA index register taking ~1350 ns of CPU time.
+
+Add a run-time debugfs switch tx_skip_idle (/sys/kernel/debug/ieee80211/
+phy1/mt76/tx_skip_idle, default 0). When enabled, mt76x02_clean_tx_queue()
+skips calling mt76_queue_tx_cleanup() if READ_ONCE(q->queued) == 0 in both
+Pass 1 and Pass 2.
+
+This preserves wake_up(&dev->tx_wait) because any waiter checks the pending
+condition before sleeping, and any queue that held frames issued wake_up
+when it transitioned to empty. The Pass 2 race remains closed: if frames
+were queued or in flight around napi_complete_done(), q->queued > 0 and
+Pass 2 runs cleanup; if queued after Pass 2, interrupts are already
+re-enabled and the hardware completion interrupt schedules NAPI.
+---
+ mt76x02.h         |  1 +
+ mt76x02_debugfs.c |  1 +
+ mt76x02_mmio.c    | 19 +++++++++++++++----
+ 3 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/mt76x02.h b/mt76x02.h
+index 0d13dfa2..a4043da0 100644
+--- a/mt76x02.h
++++ b/mt76x02.h
+@@ -130,6 +130,7 @@ struct mt76x02_dev {
+ 	s8 target_power;
+ 	s8 target_power_delta[2];
+ 	bool enable_tpc;
++	bool tx_skip_idle;
+ 
+ 	bool no_2ghz;
+ 
+diff --git a/mt76x02_debugfs.c b/mt76x02_debugfs.c
+index d81f696b..418f331e 100644
+--- a/mt76x02_debugfs.c
++++ b/mt76x02_debugfs.c
+@@ -141,6 +141,7 @@ void mt76x02_init_debugfs(struct mt76x02_dev *dev)
+ 				    mt76_queues_read);
+ 	debugfs_create_u8("temperature", 0400, dir, &dev->cal.temp);
+ 	debugfs_create_bool("tpc", 0600, dir, &dev->enable_tpc);
++	debugfs_create_bool("tx_skip_idle", 0600, dir, &dev->tx_skip_idle);
+ 
+ 	debugfs_create_file("edcca", 0600, dir, dev, &fops_edcca);
+ 	debugfs_create_file("ampdu_stat", 0400, dir, dev, &mt76x02_ampdu_stat_fops);
+diff --git a/mt76x02_mmio.c b/mt76x02_mmio.c
+index 8b9d5f86..a0aac1a5 100644
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -177,6 +177,17 @@ static void mt76x02_tx_worker(struct mt76_worker *w)
+ 	mt76_txq_schedule_all(&dev->mphy);
+ }
+ 
++static void mt76x02_clean_tx_queue(struct mt76x02_dev *dev, struct mt76_queue *q)
++{
++	if (!q)
++		return;
++
++	if (READ_ONCE(dev->tx_skip_idle) && !READ_ONCE(q->queued))
++		return;
++
++	mt76_queue_tx_cleanup(dev, q, false);
++}
++
+ static int mt76x02_poll_tx(struct napi_struct *napi, int budget)
+ {
+ 	struct mt76x02_dev *dev = container_of(napi, struct mt76x02_dev,
+@@ -185,16 +196,16 @@ static int mt76x02_poll_tx(struct napi_struct *napi, int budget)
+ 
+ 	mt76x02_mac_poll_tx_status(dev, false);
+ 
+-	mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[MT_MCUQ_WM], false);
++	mt76x02_clean_tx_queue(dev, dev->mt76.q_mcu[MT_MCUQ_WM]);
+ 	for (i = MT_TXQ_PSD; i >= 0; i--)
+-		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], false);
++		mt76x02_clean_tx_queue(dev, dev->mphy.q_tx[i]);
+ 
+ 	if (napi_complete_done(napi, 0))
+ 		mt76x02_irq_enable(dev, mt76x02_tx_done_int(dev));
+ 
+-	mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[MT_MCUQ_WM], false);
++	mt76x02_clean_tx_queue(dev, dev->mt76.q_mcu[MT_MCUQ_WM]);
+ 	for (i = MT_TXQ_PSD; i >= 0; i--)
+-		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], false);
++		mt76x02_clean_tx_queue(dev, dev->mphy.q_tx[i]);
+ 
+ 	mt76_worker_schedule(&dev->mt76.tx_worker);
+ 

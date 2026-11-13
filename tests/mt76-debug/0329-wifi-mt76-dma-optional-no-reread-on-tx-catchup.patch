@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Sat, 7 Nov 2026 05:37:12 +0200
+Subject: [PATCH] wifi: mt76: dma: optional no reread on tx catchup
+
+In mt76_dma_tx_cleanup(), when the descriptor processing loop catches up
+to the last read DMA index (q->tail == last), it re-reads the hardware
+DMA index register to see if more frames completed while the loop was
+running.
+
+On PCIe (MT7612E), this re-read costs ~1350 ns of CPU stall time. In T1
+measurements, this accounted for ~28,575 reads (~38.6 ms CPU time) over
+30,000 frames. While catching up frees completed frames slightly sooner,
+it is not required for correctness because any subsequent completions
+will be caught by the next NAPI poll or completion interrupt.
+
+Add a run-time debugfs switch tx_no_reread (/sys/kernel/debug/ieee80211/
+phy1/mt76/tx_no_reread, default 0). When enabled, mt76_dma_tx_cleanup()
+skips the catch-up re-read. The switch is stored in struct mt76_dev so that
+drivers not exposing the switch keep default catch-up behavior.
+---
+ dma.c             | 2 +-
+ mt76.h            | 1 +
+ mt76x02_debugfs.c | 1 +
+ 3 files changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/dma.c b/dma.c
+index a67880a9..e804ae3b 100644
+--- a/dma.c
++++ b/dma.c
+@@ -444,7 +444,7 @@ mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
+ 				mt76_put_txwi(dev, entry.txwi);
+ 		}
+ 
+-		if (!flush && q->tail == last)
++		if (!flush && !READ_ONCE(dev->tx_no_reread) && q->tail == last)
+ 			last = mt76_dma_read_dma_idx(q, -1);
+ 	}
+ 	spin_unlock_bh(&q->cleanup_lock);
+diff --git a/mt76.h b/mt76.h
+index 4788af1b..51c980e3 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -1049,6 +1049,7 @@ struct mt76_dev {
+ 	};
+ 
+ 	atomic_t bus_hung;
++	bool tx_no_reread;
+ };
+ 
+ /* per-phy stats.  */
+diff --git a/mt76x02_debugfs.c b/mt76x02_debugfs.c
+index 418f331e..c9b68db3 100644
+--- a/mt76x02_debugfs.c
++++ b/mt76x02_debugfs.c
+@@ -142,6 +142,7 @@ void mt76x02_init_debugfs(struct mt76x02_dev *dev)
+ 	debugfs_create_u8("temperature", 0400, dir, &dev->cal.temp);
+ 	debugfs_create_bool("tpc", 0600, dir, &dev->enable_tpc);
+ 	debugfs_create_bool("tx_skip_idle", 0600, dir, &dev->tx_skip_idle);
++	debugfs_create_bool("tx_no_reread", 0600, dir, &dev->mt76.tx_no_reread);
+ 
+ 	debugfs_create_file("edcca", 0600, dir, dev, &fops_edcca);
+ 	debugfs_create_file("ampdu_stat", 0400, dir, dev, &mt76x02_ampdu_stat_fops);

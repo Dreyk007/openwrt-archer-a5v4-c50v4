@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Sun, 8 Nov 2026 00:42:50 +0200
+Subject: [PATCH 1/2] wifi: mt76: mt76x02: tx completions from descriptors
+ instead of dma index
+
+On MT7612E (PCIe), reading the hardware DMA TX index register (dma_idx)
+over PCIe takes ~1350 ns per uncached MMIO read. In high-throughput TX,
+reading this register on every NAPI cleanup poll incurs significant CPU
+overhead on MIPS 24Kc (580 MHz).
+
+The MT7612E DMA engine supports hardware TX writeback (EnTXWriteBackDDONE,
+bit 6 of MT_WPDMA_GLO_CFG 0x0208). When enabled, the DMA engine writes
+back the MT_DMA_CTL_DMA_DONE bit directly into the descriptor in host
+uncached coherent memory (KSEG1, ~104 ns read latency) upon completing
+frame transmission.
+
+Add support for descriptor-based TX completion for data queues (VO, VI,
+BE, BK) via MT_QFLAG_TX_WB, guarded by the runtime switch tx_wb_mode:
+- 0: Disabled (standard dma_idx cleanup; writeback disabled)
+- 1: Shadow mode (hardware writeback enabled; cleanup via dma_idx)
+- 2: Active mode (clean up completed descriptors via DMA_DONE walk;
+     fallback to dma_idx if no progress was made while frames queued)
+- 3: Active + Verify mode (active descriptor walk followed by dma_idx
+     verification)
+
+MCU and PSD queues remain on index-based cleanup. Flush and queue resets
+continue to use dma_idx.
+---
+ dma.c             | 90 ++++++++++++++++++++++++++++++++++++++++-------
+ mt76.h            |  2 ++
+ mt76x02_debugfs.c | 28 +++++++++++++++
+ mt76x02_dma.h     |  1 +
+ mt76x02_mmio.c    | 22 ++++++++++--
+ 5 files changed, 128 insertions(+), 15 deletions(-)
+
+diff --git a/dma.c b/dma.c
+index e804ae3b..8e62c714 100644
+--- a/dma.c
++++ b/dma.c
+@@ -420,32 +420,96 @@ mt76_dma_kick_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ }
+ 
+ static void
+-mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
++mt76_dma_tx_cleanup_one(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+ 	struct mt76_queue_entry entry;
++
++	mt76_dma_tx_cleanup_idx(dev, q, q->tail, &entry);
++	mt76_npu_txdesc_cleanup(q, q->tail);
++	mt76_queue_tx_complete(dev, q, &entry);
++
++	if (entry.txwi && !(dev->drv->drv_flags & MT_DRV_TXWI_NO_FREE))
++		mt76_put_txwi(dev, entry.txwi);
++}
++
++static void
++mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
++{
++	bool use_wb;
+ 	int last;
+ 
+ 	if (!q || !q->ndesc)
+ 		return;
+ 
++	use_wb = (q->flags & MT_QFLAG_TX_WB) && !flush &&
++		 (READ_ONCE(dev->tx_wb_mode) >= 2);
++
+ 	spin_lock_bh(&q->cleanup_lock);
+-	if (flush)
+-		last = -1;
+-	else
+-		last = mt76_dma_read_dma_idx(q, -1);
++	if (use_wb) {
++		int done = 0;
++
++		while (q->queued > 0) {
++			u32 ctrl = le32_to_cpu(READ_ONCE(q->desc[q->tail].ctrl));
+ 
+-	while (q->queued > 0 && q->tail != last) {
+-		mt76_dma_tx_cleanup_idx(dev, q, q->tail, &entry);
+-		mt76_npu_txdesc_cleanup(q, q->tail);
+-		mt76_queue_tx_complete(dev, q, &entry);
++			if (!(ctrl & MT_DMA_CTL_DMA_DONE))
++				break;
++			dma_rmb();
+ 
+-		if (entry.txwi) {
+-			if (!(dev->drv->drv_flags & MT_DRV_TXWI_NO_FREE))
+-				mt76_put_txwi(dev, entry.txwi);
++			mt76_dma_tx_cleanup_one(dev, q);
++			done++;
+ 		}
+ 
+-		if (!flush && !READ_ONCE(dev->tx_no_reread) && q->tail == last)
++		if (done == 0 && q->queued > 0) {
++			last = mt76_dma_read_dma_idx(q, -1);
++			if (last >= 0 && last != q->tail) {
++				int diff = (last - q->tail + q->ndesc) % q->ndesc;
++
++				/*
++				 * Complete by index only when diff <= q->queued and
++				 * diff < q->ndesc - MT_TXQ_FREE_THR.
++				 * Assumption: the walk is never ahead of the index by
++				 * ndesc - queued or more.
++				 */
++				if (diff <= q->queued &&
++				    diff < q->ndesc - MT_TXQ_FREE_THR) {
++					while (diff > 0 && q->queued > 0) {
++						mt76_dma_tx_cleanup_one(dev, q);
++						diff--;
++					}
++				}
++			}
++		} else if (READ_ONCE(dev->tx_wb_mode) == 3 && q->queued > 0) {
+ 			last = mt76_dma_read_dma_idx(q, -1);
++			if (last >= 0 && last != q->tail) {
++				int diff = (last - q->tail + q->ndesc) % q->ndesc;
++
++				/*
++				 * Complete by index only when diff <= q->queued and
++				 * diff < q->ndesc - MT_TXQ_FREE_THR.
++				 * Assumption: the walk is never ahead of the index by
++				 * ndesc - queued or more.
++				 */
++				if (diff <= q->queued &&
++				    diff < q->ndesc - MT_TXQ_FREE_THR) {
++					while (diff > 0 && q->queued > 0) {
++						mt76_dma_tx_cleanup_one(dev, q);
++						diff--;
++					}
++				}
++			}
++		}
++	} else {
++		if (flush)
++			last = -1;
++		else
++			last = mt76_dma_read_dma_idx(q, -1);
++
++		while (q->queued > 0 && q->tail != last) {
++			mt76_dma_tx_cleanup_one(dev, q);
++
++			if (!flush && !READ_ONCE(dev->tx_no_reread) && q->tail == last)
++				last = mt76_dma_read_dma_idx(q, -1);
++		}
+ 	}
+ 	spin_unlock_bh(&q->cleanup_lock);
+ 
+diff --git a/mt76.h b/mt76.h
+index 51c980e3..22d6a7a3 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -48,6 +48,7 @@
+ #define MT_QFLAG_WED_RRO_EN	BIT(7)
+ #define MT_QFLAG_EMI_EN		BIT(8)
+ #define MT_QFLAG_NPU		BIT(9)
++#define MT_QFLAG_TX_WB		BIT(10)
+ 
+ #define __MT_WED_Q(_type, _n)	(MT_QFLAG_WED | \
+ 				 FIELD_PREP(MT_QFLAG_WED_TYPE, _type) | \
+@@ -1050,6 +1051,7 @@ struct mt76_dev {
+ 
+ 	atomic_t bus_hung;
+ 	bool tx_no_reread;
++	u8 tx_wb_mode;
+ };
+ 
+ /* per-phy stats.  */
+diff --git a/mt76x02_debugfs.c b/mt76x02_debugfs.c
+index b3658f59..0f380dc2 100644
+--- a/mt76x02_debugfs.c
++++ b/mt76x02_debugfs.c
+@@ -5,6 +5,7 @@
+ 
+ #include <linux/debugfs.h>
+ #include "mt76x02.h"
++#include "mt76x02_dma.h"
+ 
+ static int
+ mt76x02_ampdu_stat_show(struct seq_file *file, void *data)
+@@ -129,6 +130,32 @@ static int mt76x02_read_rate_txpower(struct seq_file *s, void *data)
+ 	return 0;
+ }
+ 
++static int
++mt76x02_tx_wb_mode_set(void *data, u64 val)
++{
++	struct mt76x02_dev *dev = data;
++
++	if (val > 3)
++		return -EINVAL;
++
++	WRITE_ONCE(dev->mt76.tx_wb_mode, (u8)val);
++	mt76x02_set_tx_writeback(dev, val != 0);
++
++	return 0;
++}
++
++static int
++mt76x02_tx_wb_mode_get(void *data, u64 *val)
++{
++	struct mt76x02_dev *dev = data;
++
++	*val = READ_ONCE(dev->mt76.tx_wb_mode);
++	return 0;
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE(fops_tx_wb_mode, mt76x02_tx_wb_mode_get,
++			 mt76x02_tx_wb_mode_set, "%lld\n");
++
+ void mt76x02_init_debugfs(struct mt76x02_dev *dev)
+ {
+ 	struct dentry *dir;
+@@ -147,6 +174,7 @@ void mt76x02_init_debugfs(struct mt76x02_dev *dev)
+ 			    &dev->tx_skip_complete_stat);
+ 	debugfs_create_bool("tx_skip_napi_stat", 0600, dir,
+ 			    &dev->tx_skip_napi_stat);
++	debugfs_create_file("tx_wb_mode", 0600, dir, dev, &fops_tx_wb_mode);
+ 
+ 	debugfs_create_file("edcca", 0600, dir, dev, &fops_edcca);
+ 	debugfs_create_file("ampdu_stat", 0400, dir, dev, &mt76x02_ampdu_stat_fops);
+diff --git a/mt76x02_dma.h b/mt76x02_dma.h
+index 2f6ba8cf..537367e2 100644
+--- a/mt76x02_dma.h
++++ b/mt76x02_dma.h
+@@ -61,5 +61,6 @@ mt76x02_wait_for_wpdma(struct mt76_dev *dev, int timeout)
+ 
+ int mt76x02_dma_init(struct mt76x02_dev *dev);
+ void mt76x02_dma_disable(struct mt76x02_dev *dev);
++void mt76x02_set_tx_writeback(struct mt76x02_dev *dev, bool enable);
+ 
+ #endif /* __MT76x02_DMA_H */
+diff --git a/mt76x02_mmio.c b/mt76x02_mmio.c
+index e0906ab2..f52cc40d 100644
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -242,6 +242,8 @@ int mt76x02_dma_init(struct mt76x02_dev *dev)
+ 					 MT_TX_RING_BASE, NULL, 0);
+ 		if (ret)
+ 			return ret;
++
++		dev->mphy.q_tx[i]->flags |= MT_QFLAG_TX_WB;
+ 	}
+ 
+ 	ret = mt76_init_tx_queue(&dev->mphy, MT_TXQ_PSD, MT_TX_HW_QUEUE_MGMT,
+@@ -366,10 +368,26 @@ static void mt76x02_dma_enable(struct mt76x02_dev *dev)
+ 	val = FIELD_PREP(MT_WPDMA_GLO_CFG_DMA_BURST_SIZE, 3) |
+ 	      MT_WPDMA_GLO_CFG_TX_DMA_EN |
+ 	      MT_WPDMA_GLO_CFG_RX_DMA_EN;
++	if (READ_ONCE(dev->mt76.tx_wb_mode))
++		val |= MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE;
+ 	mt76_set(dev, MT_WPDMA_GLO_CFG, val);
+-	mt76_clear(dev, MT_WPDMA_GLO_CFG,
+-		   MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE);
++	if (!READ_ONCE(dev->mt76.tx_wb_mode))
++		mt76_clear(dev, MT_WPDMA_GLO_CFG,
++			   MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE);
++}
++
++void mt76x02_set_tx_writeback(struct mt76x02_dev *dev, bool enable)
++{
++	u32 val = mt76_rr(dev, MT_WPDMA_GLO_CFG);
++
++	val &= ~(MT_WPDMA_GLO_CFG_TX_DMA_BUSY |
++		 MT_WPDMA_GLO_CFG_RX_DMA_BUSY |
++		 MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE);
++	if (enable)
++		val |= MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE;
++	mt76_wr(dev, MT_WPDMA_GLO_CFG, val);
+ }
++EXPORT_SYMBOL_GPL(mt76x02_set_tx_writeback);
+ 
+ void mt76x02_dma_disable(struct mt76x02_dev *dev)
+ {

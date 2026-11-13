@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Sat, 7 Nov 2026 19:40:01 +0200
+Subject: [PATCH] wifi: mt76: mt76x02: skip tx status polling on completion
+ without pending status
+
+In mt76x02_tx_complete_skb(), the driver unconditionally calls
+mt76x02_mac_poll_tx_status() for every completed frame that has a TXWI.
+In normal data traffic, each call performs two 32-bit register reads
+(MT_TX_STAT_FIFO_EXT and MT_TX_STAT_FIFO) over PCIe, stalling the MIPS CPU
+for ~1350 ns per read (~2.7 us per poll).
+
+During a 22.6 s UDP burst of ~38,000 frames, tx_complete calls status polling
+37,696 times, and almost all calls find an empty status FIFO because NAPI
+and the hard IRQ already drain status entries. Furthermore, ordinary data
+frames do not request an skb-attached status (mt76_is_skb_pktid is false).
+Only special frames (probes, EAPOL, rate control probes) require status
+matching before skb completion.
+
+Add a run-time debugfs switch tx_skip_complete_stat (/sys/kernel/debug/
+ieee80211/phy1/mt76/tx_skip_complete_stat, default 0). When enabled,
+mt76x02_tx_complete_skb() skips mt76x02_mac_poll_tx_status() unless the
+completing frame has an skb packet ID assigned and has not yet received its
+TX status callback.
+
+This avoids ~37,690 redundant FIFO polls (~75,380 PCIe reads, ~102 ms CPU
+time per 22.6 s run) while preserving immediate polling for frames that
+actually await completion status.
+---
+ mt76x02.h         |  1 +
+ mt76x02_debugfs.c |  2 ++
+ mt76x02_mac.c     | 15 +++++++++++++--
+ 3 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/mt76x02.h b/mt76x02.h
+index a4043da0..ae2246bc 100644
+--- a/mt76x02.h
++++ b/mt76x02.h
+@@ -131,6 +131,7 @@ struct mt76x02_dev {
+ 	s8 target_power_delta[2];
+ 	bool enable_tpc;
+ 	bool tx_skip_idle;
++	bool tx_skip_complete_stat;
+ 
+ 	bool no_2ghz;
+ 
+diff --git a/mt76x02_debugfs.c b/mt76x02_debugfs.c
+index c9b68db3..670d4d01 100644
+--- a/mt76x02_debugfs.c
++++ b/mt76x02_debugfs.c
+@@ -143,6 +143,8 @@ void mt76x02_init_debugfs(struct mt76x02_dev *dev)
+ 	debugfs_create_bool("tpc", 0600, dir, &dev->enable_tpc);
+ 	debugfs_create_bool("tx_skip_idle", 0600, dir, &dev->tx_skip_idle);
+ 	debugfs_create_bool("tx_no_reread", 0600, dir, &dev->mt76.tx_no_reread);
++	debugfs_create_bool("tx_skip_complete_stat", 0600, dir,
++			    &dev->tx_skip_complete_stat);
+ 
+ 	debugfs_create_file("edcca", 0600, dir, dev, &fops_edcca);
+ 	debugfs_create_file("ampdu_stat", 0400, dir, dev, &mt76x02_ampdu_stat_fops);
+diff --git a/mt76x02_mac.c b/mt76x02_mac.c
+index 457767bb..8d7759c1 100644
+--- a/mt76x02_mac.c
++++ b/mt76x02_mac.c
+@@ -938,6 +938,7 @@ void mt76x02_tx_complete_skb(struct mt76_dev *mdev, struct mt76_queue_entry *e)
+ {
+ 	struct mt76x02_dev *dev = container_of(mdev, struct mt76x02_dev, mt76);
+ 	struct mt76x02_txwi *txwi;
++	bool poll = true;
+ 	u8 *txwi_ptr;
+ 
+ 	if (!e->txwi) {
+@@ -945,10 +946,20 @@ void mt76x02_tx_complete_skb(struct mt76_dev *mdev, struct mt76_queue_entry *e)
+ 		return;
+ 	}
+ 
+-	mt76x02_mac_poll_tx_status(dev, false);
+-
+ 	txwi_ptr = mt76_get_txwi_ptr(mdev, e->txwi);
+ 	txwi = (struct mt76x02_txwi *)txwi_ptr;
++
++	if (READ_ONCE(dev->tx_skip_complete_stat)) {
++		struct mt76_tx_cb *cb = mt76_tx_skb_cb(e->skb);
++
++		if (!mt76_is_skb_pktid(txwi->pktid) ||
++		    (cb->flags & MT_TX_CB_TXS_DONE))
++			poll = false;
++	}
++
++	if (poll)
++		mt76x02_mac_poll_tx_status(dev, false);
++
+ 	trace_mac_txdone(mdev, txwi->wcid, txwi->pktid);
+ 
+ 	mt76_tx_complete_skb(mdev, e->wcid, e->skb);

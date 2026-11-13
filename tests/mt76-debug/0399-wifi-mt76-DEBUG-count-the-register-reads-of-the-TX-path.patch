@@ -1,0 +1,1042 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Sun, 8 Nov 2026 15:35:18 +0200
+Subject: [PATCH 2/2] wifi: mt76: DEBUG: count the register reads of the TX
+ path
+
+Add debug counters in struct mt76_dev to price and locate register reads
+on the TX path of mt76 devices (in particular mt76x02 on PCIe):
+
+- mt76_dma_tx_cleanup: calls per queue, calls on empty queue, first index
+  reads, catch-up re-reads, and entries completed per queue;
+- T3 descriptor walk and fallback counters: clean_done_walk,
+  clean_done_idx, walk_empty, fallback_progress, desc_reads per queue;
+- T3 shadow mode (mode 1) counters: shadow_missing,
+  shadow_missing_after_next, shadow_ooo (out-of-order completions),
+  shadow_unverifiable (reused slots), shadow_missing_overflow,
+  shadow_early, and shadow_max_gap;
+- T3 verify mode (mode 3) and index safety counters: walk_behind,
+  walk_ahead, walk_max_behind, walk_max_ahead, index_behind,
+  index_max_behind, and index_ambiguous;
+- mt76x02_poll_tx / mt7603_poll_tx: polls and entries completed in the
+  first and second passes;
+- mt76x02_mac_poll_tx_status: calls per caller (IRQ, TX NAPI, TX worker,
+  mt76x02_tx_complete_skb), valid status reads and empty reads;
+- tx_hang index reads and interrupts handled;
+- total mmio_rr calls across the device.
+
+Expose the counters via debugfs file 'tx_reads' (writing any value resets
+all counters), 'rr_cost' (pricing register reads over bus/PCIe, coherent
+DMA descriptor uncached read, and cached RAM read), and 'desc_rd_cost'
+(pricing uncached descriptor control word read latency).
+
+Debug instrumentation only, never in the release image.
+---
+ debugfs.c      | 301 +++++++++++++++++++++++++++++++++++++++++++++++++
+ dma.c          | 151 +++++++++++++++++++++++--
+ mac80211.c     |   1 +
+ mmio.c         |   1 +
+ mt76.h         | 121 +++++++++++++++++++-
+ mt7603/core.c  |   1 +
+ mt7603/dma.c   |  14 ++-
+ mt7603/mac.c   |   1 +
+ mt76x02_mac.c  |  20 +++-
+ mt76x02_mac.h  |   3 +-
+ mt76x02_mmio.c |  38 ++++---
+ tx.c           |   2 +
+ 12 files changed, 620 insertions(+), 34 deletions(-)
+
+diff --git a/debugfs.c b/debugfs.c
+index 41d1d486..e6ac4318 100644
+--- a/debugfs.c
++++ b/debugfs.c
+@@ -2,6 +2,8 @@
+ /*
+  * Copyright (C) 2016 Felix Fietkau <nbd@nbd.name>
+  */
++#include <linux/ktime.h>
++#include <linux/math64.h>
+ #include "mt76.h"
+ 
+ static int
+@@ -100,6 +102,301 @@ void mt76_seq_puts_array(struct seq_file *file, const char *str,
+ }
+ EXPORT_SYMBOL_GPL(mt76_seq_puts_array);
+ 
++static int mt76_tx_reads_show(struct seq_file *s, void *data)
++{
++	struct mt76_dev *dev = s->private;
++	u64 now = ktime_get_ns();
++	u64 elapsed = (now >= dev->tx_reads.reset_time) ?
++		      (now - dev->tx_reads.reset_time) : 0;
++	static const char * const qnames[] = {
++		[MT76_CLEAN_Q_MCU] = "mcu",
++		[MT76_CLEAN_Q_PSD] = "psd",
++		[MT76_CLEAN_Q_BE] = "be",
++		[MT76_CLEAN_Q_BK] = "bk",
++		[MT76_CLEAN_Q_VI] = "vi",
++		[MT76_CLEAN_Q_VO] = "vo",
++		[MT76_CLEAN_Q_OTHER] = "other",
++	};
++	static const char * const callers[] = {
++		[MT76_STAT_CALLER_IRQ] = "irq",
++		[MT76_STAT_CALLER_NAPI] = "napi",
++		[MT76_STAT_CALLER_WORKER] = "worker",
++		[MT76_STAT_CALLER_TX_COMPLETE] = "tx_complete",
++	};
++	int i;
++
++	seq_printf(s, "elapsed_ns %llu\n", elapsed);
++
++	for (i = 0; i < __MT76_CLEAN_Q_MAX; i++)
++		seq_printf(s, "clean_calls_%s %d\n", qnames[i],
++			   atomic_read(&dev->tx_reads.clean_calls[i]));
++
++	for (i = 0; i < __MT76_CLEAN_Q_MAX; i++)
++		seq_printf(s, "clean_empty_%s %d\n", qnames[i],
++			   atomic_read(&dev->tx_reads.clean_empty[i]));
++
++	for (i = 0; i < __MT76_CLEAN_Q_MAX; i++)
++		seq_printf(s, "clean_skipped_%s %d\n", qnames[i],
++			   atomic_read(&dev->tx_reads.clean_skipped[i]));
++
++	for (i = 0; i < __MT76_CLEAN_Q_MAX; i++)
++		seq_printf(s, "clean_first_idx_%s %d\n", qnames[i],
++			   atomic_read(&dev->tx_reads.clean_first_idx_reads[i]));
++
++	for (i = 0; i < __MT76_CLEAN_Q_MAX; i++)
++		seq_printf(s, "clean_re_reads_%s %d\n", qnames[i],
++			   atomic_read(&dev->tx_reads.clean_re_reads[i]));
++
++	for (i = 0; i < __MT76_CLEAN_Q_MAX; i++)
++		seq_printf(s, "clean_done_%s %d\n", qnames[i],
++			   atomic_read(&dev->tx_reads.clean_done[i]));
++
++	for (i = 0; i < __MT76_CLEAN_Q_MAX; i++)
++		seq_printf(s, "clean_done_walk_%s %d\n", qnames[i],
++			   atomic_read(&dev->tx_reads.clean_done_walk[i]));
++
++	for (i = 0; i < __MT76_CLEAN_Q_MAX; i++)
++		seq_printf(s, "clean_done_idx_%s %d\n", qnames[i],
++			   atomic_read(&dev->tx_reads.clean_done_idx[i]));
++
++	for (i = 0; i < __MT76_CLEAN_Q_MAX; i++)
++		seq_printf(s, "walk_empty_%s %d\n", qnames[i],
++			   atomic_read(&dev->tx_reads.walk_empty[i]));
++
++	for (i = 0; i < __MT76_CLEAN_Q_MAX; i++)
++		seq_printf(s, "fallback_progress_%s %d\n", qnames[i],
++			   atomic_read(&dev->tx_reads.fallback_progress[i]));
++
++	for (i = 0; i < __MT76_CLEAN_Q_MAX; i++)
++		seq_printf(s, "desc_reads_%s %d\n", qnames[i],
++			   atomic_read(&dev->tx_reads.desc_reads[i]));
++
++	seq_printf(s, "shadow_missing %d\n",
++		   atomic_read(&dev->tx_reads.shadow_missing));
++	seq_printf(s, "shadow_missing_after_next %d\n",
++		   atomic_read(&dev->tx_reads.shadow_missing_after_next));
++	seq_printf(s, "shadow_ooo %d\n",
++		   atomic_read(&dev->tx_reads.shadow_ooo));
++	seq_printf(s, "shadow_unverifiable %d\n",
++		   atomic_read(&dev->tx_reads.shadow_unverifiable));
++	seq_printf(s, "shadow_missing_overflow %d\n",
++		   atomic_read(&dev->tx_reads.shadow_missing_overflow));
++	seq_printf(s, "shadow_early %d\n",
++		   atomic_read(&dev->tx_reads.shadow_early));
++	seq_printf(s, "shadow_max_gap %d\n", dev->tx_reads.shadow_max_gap);
++
++	seq_printf(s, "walk_behind %d\n",
++		   atomic_read(&dev->tx_reads.walk_behind));
++	seq_printf(s, "walk_ahead %d\n",
++		   atomic_read(&dev->tx_reads.walk_ahead));
++	seq_printf(s, "walk_max_behind %d\n", dev->tx_reads.walk_max_behind);
++	seq_printf(s, "walk_max_ahead %d\n", dev->tx_reads.walk_max_ahead);
++	seq_printf(s, "index_behind %d\n",
++		   atomic_read(&dev->tx_reads.index_behind));
++	seq_printf(s, "index_max_behind %d\n", dev->tx_reads.index_max_behind);
++	seq_printf(s, "index_ambiguous %d\n",
++		   atomic_read(&dev->tx_reads.index_ambiguous));
++
++	seq_printf(s, "tx_napi_polls %d\n",
++		   atomic_read(&dev->tx_reads.tx_napi_polls));
++	seq_printf(s, "tx_napi_pass1_done %d\n",
++		   atomic_read(&dev->tx_reads.tx_napi_pass1_done));
++	seq_printf(s, "tx_napi_pass2_done %d\n",
++		   atomic_read(&dev->tx_reads.tx_napi_pass2_done));
++
++	for (i = 0; i < __MT76_STAT_CALLER_MAX; i++)
++		seq_printf(s, "stat_poll_%s %d\n", callers[i],
++			   atomic_read(&dev->tx_reads.stat_poll_calls[i]));
++
++	seq_printf(s, "stat_valid_reads %d\n",
++		   atomic_read(&dev->tx_reads.stat_valid_reads));
++	seq_printf(s, "stat_empty_reads %d\n",
++		   atomic_read(&dev->tx_reads.stat_empty_reads));
++	seq_printf(s, "stat_skb_requested %d\n",
++		   atomic_read(&dev->tx_reads.stat_skb_requested));
++	seq_printf(s, "stat_skb_matched %d\n",
++		   atomic_read(&dev->tx_reads.stat_skb_matched));
++	seq_printf(s, "stat_skb_timeouts %d\n",
++		   atomic_read(&dev->tx_reads.stat_skb_timeouts));
++	seq_printf(s, "stat_poll_complete_skipped %d\n",
++		   atomic_read(&dev->tx_reads.stat_poll_complete_skipped));
++	seq_printf(s, "stat_poll_napi_skipped %d\n",
++		   atomic_read(&dev->tx_reads.stat_poll_napi_skipped));
++
++	seq_printf(s, "tx_hang_idx_reads %d\n",
++		   atomic_read(&dev->tx_reads.tx_hang_idx_reads));
++
++	seq_printf(s, "irq_handled %d\n",
++		   atomic_read(&dev->tx_reads.irq_handled));
++
++	seq_printf(s, "mmio_rr_total %d\n",
++		   atomic_read(&dev->tx_reads.mmio_rr_total));
++
++	return 0;
++}
++
++static ssize_t
++mt76_tx_reads_write(struct file *file, const char __user *user_buf,
++		    size_t count, loff_t *ppos)
++{
++	struct seq_file *s = file->private_data;
++	struct mt76_dev *dev = s->private;
++
++	memset(&dev->tx_reads, 0, sizeof(dev->tx_reads));
++	dev->tx_reads.reset_time = ktime_get_ns();
++
++	return count;
++}
++
++static int mt76_tx_reads_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, mt76_tx_reads_show, inode->i_private);
++}
++
++static const struct file_operations fops_tx_reads = {
++	.open = mt76_tx_reads_open,
++	.read = seq_read,
++	.write = mt76_tx_reads_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static int mt76_rr_cost_show(struct seq_file *s, void *data)
++{
++	struct mt76_dev *dev;
++	volatile u32 *desc_word = NULL;
++	volatile u32 cached_word = 0x5a5a5a5a;
++	unsigned long flags;
++	u64 t0, t1;
++	u64 ns_reg, ns_desc = 0, ns_cached;
++	u32 reg, val = 0;
++	int i;
++
++	dev = s->private;
++	if (!mt76_is_mmio(dev))
++		return -EOPNOTSUPP;
++
++	/*
++	 * MT_INT_SOURCE_CSR:
++	 *   MT7612E (PCIe): 0x0200
++	 *   MT7603 (SoC bus): 0x4200 (MT_HIF(0x200))
++	 */
++	reg = (mt76_chip(dev) == 0x7603) ? 0x4200 : 0x0200;
++
++	for (i = 0; i < ARRAY_SIZE(dev->phy.q_tx); i++) {
++		if (dev->phy.q_tx[i] && dev->phy.q_tx[i]->desc) {
++			desc_word = (volatile u32 *)dev->phy.q_tx[i]->desc;
++			break;
++		}
++	}
++
++	/* 1. Register read */
++	local_irq_save(flags);
++	t0 = ktime_get_ns();
++	for (i = 0; i < 1000; i++)
++		val += readl(dev->mmio.regs + reg);
++	t1 = ktime_get_ns();
++	local_irq_restore(flags);
++	ns_reg = t1 - t0;
++
++	/* 2. Coherent DMA descriptor word read (uncached) */
++	if (desc_word) {
++		local_irq_save(flags);
++		t0 = ktime_get_ns();
++		for (i = 0; i < 1000; i++)
++			val += *desc_word;
++		t1 = ktime_get_ns();
++		local_irq_restore(flags);
++		ns_desc = t1 - t0;
++	}
++
++	/* 3. Cached RAM word read */
++	local_irq_save(flags);
++	t0 = ktime_get_ns();
++	for (i = 0; i < 1000; i++)
++		val += cached_word;
++	t1 = ktime_get_ns();
++	local_irq_restore(flags);
++	ns_cached = t1 - t0;
++
++	if (val == 0x12345678)
++		seq_printf(s, "# %x\n", val);
++
++	seq_printf(s, "reg %llu\n", div_u64(ns_reg, 1000));
++	if (desc_word)
++		seq_printf(s, "desc %llu\n", div_u64(ns_desc, 1000));
++	else
++		seq_puts(s, "desc 0\n");
++	seq_printf(s, "cached %llu\n", div_u64(ns_cached, 1000));
++	seq_printf(s, "reg_total_ns %llu\n", ns_reg);
++	seq_printf(s, "desc_total_ns %llu\n", ns_desc);
++	seq_printf(s, "cached_total_ns %llu\n", ns_cached);
++
++	return 0;
++}
++
++static int mt76_rr_cost_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, mt76_rr_cost_show, inode->i_private);
++}
++
++static const struct file_operations fops_rr_cost = {
++	.open = mt76_rr_cost_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static int mt76_desc_rd_cost_show(struct seq_file *s, void *data)
++{
++	struct mt76_dev *dev = s->private;
++	volatile u32 *desc_word = NULL;
++	unsigned long flags;
++	u64 t0, t1, ns_desc = 0;
++	u32 val = 0;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(dev->phy.q_tx); i++) {
++		if (dev->phy.q_tx[i] && dev->phy.q_tx[i]->desc) {
++			desc_word = (volatile u32 *)dev->phy.q_tx[i]->desc;
++			break;
++		}
++	}
++
++	if (desc_word) {
++		local_irq_save(flags);
++		t0 = ktime_get_ns();
++		for (i = 0; i < 1000; i++)
++			val += *desc_word;
++		t1 = ktime_get_ns();
++		local_irq_restore(flags);
++		ns_desc = t1 - t0;
++	}
++
++	if (val == 0x12345678)
++		seq_printf(s, "# %x\n", val);
++
++	if (desc_word)
++		seq_printf(s, "desc %llu\n", div_u64(ns_desc, 1000));
++	else
++		seq_puts(s, "desc 0\n");
++	seq_printf(s, "desc_total_ns %llu\n", ns_desc);
++
++	return 0;
++}
++
++static int mt76_desc_rd_cost_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, mt76_desc_rd_cost_show, inode->i_private);
++}
++
++static const struct file_operations fops_desc_rd_cost = {
++	.open = mt76_desc_rd_cost_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
+ struct dentry *
+ mt76_register_debugfs_fops(struct mt76_phy *phy,
+ 			   const struct file_operations *ops)
+@@ -120,6 +417,10 @@ mt76_register_debugfs_fops(struct mt76_phy *phy,
+ 		debugfs_create_blob("otp", 0400, dir, &dev->otp);
+ 	debugfs_create_devm_seqfile(dev->dev, "rx-queues", dir,
+ 				    mt76_rx_queues_read);
++	dev->tx_reads.reset_time = ktime_get_ns();
++	debugfs_create_file("tx_reads", 0600, dir, dev, &fops_tx_reads);
++	debugfs_create_file("rr_cost", 0400, dir, dev, &fops_rr_cost);
++	debugfs_create_file("desc_rd_cost", 0400, dir, dev, &fops_desc_rd_cost);
+ 
+ 	return dir;
+ }
+diff --git a/dma.c b/dma.c
+index 8e62c714..9c393126 100644
+--- a/dma.c
++++ b/dma.c
+@@ -234,6 +234,7 @@ void mt76_dma_queue_reset(struct mt76_dev *dev, struct mt76_queue *q,
+ 	}
+ 
+ 	mt76_dma_queue_magic_cnt_init(dev, q);
++	q->n_shadow_missing = 0;
+ 	if (reset_idx) {
+ 		if (mt76_queue_is_emi(q))
+ 			*q->emi_cpu_idx = 0;
+@@ -432,34 +433,50 @@ mt76_dma_tx_cleanup_one(struct mt76_dev *dev, struct mt76_queue *q)
+ 		mt76_put_txwi(dev, entry.txwi);
+ }
+ 
+-static void
++static int
+ mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
+ {
++	enum mt76_tx_cleanup_qid qid;
+ 	bool use_wb;
+ 	int last;
++	int done = 0;
+ 
+ 	if (!q || !q->ndesc)
+-		return;
++		return 0;
+ 
++	qid = mt76_get_cleanup_qid(dev, q);
+ 	use_wb = (q->flags & MT_QFLAG_TX_WB) && !flush &&
+ 		 (READ_ONCE(dev->tx_wb_mode) >= 2);
+ 
++	atomic_inc(&dev->tx_reads.clean_calls[qid]);
++	if (!q->queued)
++		atomic_inc(&dev->tx_reads.clean_empty[qid]);
++
+ 	spin_lock_bh(&q->cleanup_lock);
+ 	if (use_wb) {
+-		int done = 0;
++		int wb_done = 0;
+ 
+ 		while (q->queued > 0) {
+-			u32 ctrl = le32_to_cpu(READ_ONCE(q->desc[q->tail].ctrl));
++			u32 ctrl;
++
++			atomic_inc(&dev->tx_reads.desc_reads[qid]);
++			ctrl = le32_to_cpu(READ_ONCE(q->desc[q->tail].ctrl));
+ 
+ 			if (!(ctrl & MT_DMA_CTL_DMA_DONE))
+ 				break;
+ 			dma_rmb();
+ 
+ 			mt76_dma_tx_cleanup_one(dev, q);
+-			done++;
++			wb_done++;
+ 		}
++		atomic_add(wb_done, &dev->tx_reads.clean_done_walk[qid]);
++		done += wb_done;
++
++		if (wb_done == 0 && q->queued > 0) {
++			int fb_done = 0;
+ 
+-		if (done == 0 && q->queued > 0) {
++			atomic_inc(&dev->tx_reads.walk_empty[qid]);
++			atomic_inc(&dev->tx_reads.clean_first_idx_reads[qid]);
+ 			last = mt76_dma_read_dma_idx(q, -1);
+ 			if (last >= 0 && last != q->tail) {
+ 				int diff = (last - q->tail + q->ndesc) % q->ndesc;
+@@ -475,10 +492,28 @@ mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
+ 					while (diff > 0 && q->queued > 0) {
+ 						mt76_dma_tx_cleanup_one(dev, q);
+ 						diff--;
++						fb_done++;
+ 					}
++					if (fb_done > 0) {
++						atomic_inc(&dev->tx_reads.fallback_progress[qid]);
++						atomic_add(fb_done,
++							   &dev->tx_reads.clean_done_idx[qid]);
++						done += fb_done;
++					}
++				} else if (diff <= q->queued) {
++					atomic_inc(&dev->tx_reads.index_ambiguous);
++				} else {
++					int behind = (q->tail - last + q->ndesc) % q->ndesc;
++
++					atomic_inc(&dev->tx_reads.index_behind);
++					if (behind > dev->tx_reads.index_max_behind)
++						dev->tx_reads.index_max_behind = behind;
+ 				}
+ 			}
+ 		} else if (READ_ONCE(dev->tx_wb_mode) == 3 && q->queued > 0) {
++			int v_done = 0;
++
++			atomic_inc(&dev->tx_reads.clean_first_idx_reads[qid]);
+ 			last = mt76_dma_read_dma_idx(q, -1);
+ 			if (last >= 0 && last != q->tail) {
+ 				int diff = (last - q->tail + q->ndesc) % q->ndesc;
+@@ -491,28 +526,124 @@ mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
+ 				 */
+ 				if (diff <= q->queued &&
+ 				    diff < q->ndesc - MT_TXQ_FREE_THR) {
++					atomic_add(diff, &dev->tx_reads.walk_behind);
++					if (diff > dev->tx_reads.walk_max_behind)
++						dev->tx_reads.walk_max_behind = diff;
++
+ 					while (diff > 0 && q->queued > 0) {
+ 						mt76_dma_tx_cleanup_one(dev, q);
+ 						diff--;
++						v_done++;
++					}
++					if (v_done > 0) {
++						atomic_add(v_done,
++							   &dev->tx_reads.clean_done_idx[qid]);
++						done += v_done;
+ 					}
++				} else if (diff <= q->queued) {
++					atomic_inc(&dev->tx_reads.index_ambiguous);
++				} else {
++					int ahead = (q->tail - last + q->ndesc) % q->ndesc;
++
++					atomic_add(ahead, &dev->tx_reads.walk_ahead);
++					if (ahead > dev->tx_reads.walk_max_ahead)
++						dev->tx_reads.walk_max_ahead = ahead;
++
++					atomic_inc(&dev->tx_reads.index_behind);
++					if (ahead > dev->tx_reads.index_max_behind)
++						dev->tx_reads.index_max_behind = ahead;
+ 				}
+ 			}
+ 		}
+ 	} else {
+-		if (flush)
++		if (flush) {
+ 			last = -1;
+-		else
++		} else {
++			atomic_inc(&dev->tx_reads.clean_first_idx_reads[qid]);
+ 			last = mt76_dma_read_dma_idx(q, -1);
++		}
++
++		/* Mode 1 shadow checks on data queue */
++		if (READ_ONCE(dev->tx_wb_mode) == 1 &&
++		    (q->flags & MT_QFLAG_TX_WB) && !flush && last >= 0) {
++			int cur = q->tail;
++			bool saw_missing = false;
++			int i;
++
++			/* Re-check each missing position from previous cleanup */
++			for (i = 0; i < q->n_shadow_missing; i++) {
++				int pos = q->shadow_missing_pos[i];
++				int dist = (pos - q->tail + q->ndesc) % q->ndesc;
++
++				if (dist < q->queued) {
++					atomic_inc(&dev->tx_reads.shadow_unverifiable);
++				} else {
++					struct mt76_tx_reads *r = &dev->tx_reads;
++					u32 pctrl;
++
++					atomic_inc(&r->desc_reads[qid]);
++					pctrl = le32_to_cpu(READ_ONCE(q->desc[pos].ctrl));
++					if (!(pctrl & MT_DMA_CTL_DMA_DONE))
++						atomic_inc(&r->shadow_missing_after_next);
++				}
++			}
++			q->n_shadow_missing = 0;
++
++			while (cur != last && cur != q->head) {
++				u32 ctrl;
++
++				atomic_inc(&dev->tx_reads.desc_reads[qid]);
++				ctrl = le32_to_cpu(READ_ONCE(q->desc[cur].ctrl));
++				if (!(ctrl & MT_DMA_CTL_DMA_DONE)) {
++					atomic_inc(&dev->tx_reads.shadow_missing);
++					saw_missing = true;
++					if (q->n_shadow_missing < ARRAY_SIZE(q->shadow_missing_pos))
++						q->shadow_missing_pos[q->n_shadow_missing++] = cur;
++					else
++						atomic_inc(&dev->tx_reads.shadow_missing_overflow);
++				} else if (saw_missing) {
++					atomic_inc(&dev->tx_reads.shadow_ooo);
++				}
++				cur = (cur + 1) % q->ndesc;
++			}
++
++			if (last != q->head) {
++				int gap = 0;
++				int check_idx = last;
++
++				while (check_idx != q->head) {
++					u32 ctrl;
++
++					atomic_inc(&dev->tx_reads.desc_reads[qid]);
++					ctrl = le32_to_cpu(READ_ONCE(q->desc[check_idx].ctrl));
++					if (!(ctrl & MT_DMA_CTL_DMA_DONE))
++						break;
++					gap++;
++					check_idx = (check_idx + 1) % q->ndesc;
++				}
++				if (gap > 0) {
++					atomic_inc(&dev->tx_reads.shadow_early);
++					if (gap > dev->tx_reads.shadow_max_gap)
++						dev->tx_reads.shadow_max_gap = gap;
++				}
++			}
++		}
+ 
+ 		while (q->queued > 0 && q->tail != last) {
+ 			mt76_dma_tx_cleanup_one(dev, q);
++			done++;
+ 
+-			if (!flush && !READ_ONCE(dev->tx_no_reread) && q->tail == last)
++			if (!flush && !READ_ONCE(dev->tx_no_reread) && q->tail == last) {
++				atomic_inc(&dev->tx_reads.clean_re_reads[qid]);
+ 				last = mt76_dma_read_dma_idx(q, -1);
++			}
+ 		}
++		atomic_add(done, &dev->tx_reads.clean_done_idx[qid]);
+ 	}
+ 	spin_unlock_bh(&q->cleanup_lock);
+ 
++	atomic_add(done, &dev->tx_reads.clean_done[qid]);
++
+ 	if (flush) {
+ 		spin_lock_bh(&q->lock);
+ 		mt76_dma_sync_idx(dev, q);
+@@ -522,6 +653,8 @@ mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
+ 
+ 	if (!q->queued)
+ 		wake_up(&dev->tx_wait);
++
++	return done;
+ }
+ 
+ static void *
+diff --git a/mac80211.c b/mac80211.c
+index 7d27f952..7cd25452 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -697,6 +697,7 @@ mt76_alloc_device(struct device *pdev, unsigned int size,
+ 	spin_lock_init(&dev->wed_lock);
+ 	mutex_init(&dev->mutex);
+ 	init_waitqueue_head(&dev->tx_wait);
++	dev->tx_reads.reset_time = ktime_get_ns();
+ 
+ 	skb_queue_head_init(&dev->mcu.res_q);
+ 	init_waitqueue_head(&dev->mcu.wait);
+diff --git a/mmio.c b/mmio.c
+index 73d47608..894fe331 100644
+--- a/mmio.c
++++ b/mmio.c
+@@ -11,6 +11,7 @@ static u32 mt76_mmio_rr(struct mt76_dev *dev, u32 offset)
+ {
+ 	u32 val;
+ 
++	atomic_inc(&dev->tx_reads.mmio_rr_total);
+ 	val = readl(dev->mmio.regs + offset);
+ 	trace_reg_rr(dev, offset, val);
+ 
+diff --git a/mt76.h b/mt76.h
+index 22d6a7a3..dc83a152 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -278,6 +278,9 @@ struct mt76_queue {
+ 	dma_addr_t desc_dma;
+ 	struct sk_buff *rx_head;
+ 	struct page_pool *page_pool;
++#define MT76_MAX_SHADOW_MISSING	16
++	int shadow_missing_pos[MT76_MAX_SHADOW_MISSING];
++	int n_shadow_missing;
+ };
+ 
+ struct mt76_mcu_ops {
+@@ -322,8 +325,8 @@ struct mt76_queue_ops {
+ 
+ 	void (*rx_reset)(struct mt76_dev *dev, enum mt76_rxq_id qid);
+ 
+-	void (*tx_cleanup)(struct mt76_dev *dev, struct mt76_queue *q,
+-			   bool flush);
++	int (*tx_cleanup)(struct mt76_dev *dev, struct mt76_queue *q,
++			  bool flush);
+ 
+ 	void (*rx_queue_init)(struct mt76_dev *dev, enum mt76_rxq_id qid,
+ 			      int (*poll)(struct napi_struct *napi, int budget));
+@@ -336,6 +339,86 @@ struct mt76_queue_ops {
+ 			bool reset_idx);
+ };
+ 
++enum mt76_tx_cleanup_qid {
++	MT76_CLEAN_Q_MCU,
++	MT76_CLEAN_Q_PSD,
++	MT76_CLEAN_Q_BE,
++	MT76_CLEAN_Q_BK,
++	MT76_CLEAN_Q_VI,
++	MT76_CLEAN_Q_VO,
++	MT76_CLEAN_Q_OTHER,
++	__MT76_CLEAN_Q_MAX
++};
++
++enum mt76x02_tx_status_caller {
++	MT76_STAT_CALLER_IRQ,
++	MT76_STAT_CALLER_NAPI,
++	MT76_STAT_CALLER_WORKER,
++	MT76_STAT_CALLER_TX_COMPLETE,
++	__MT76_STAT_CALLER_MAX
++};
++
++struct mt76_tx_reads {
++	u64 reset_time;
++
++	/* mt76_dma_tx_cleanup */
++	atomic_t clean_calls[__MT76_CLEAN_Q_MAX];
++	atomic_t clean_empty[__MT76_CLEAN_Q_MAX];
++	atomic_t clean_first_idx_reads[__MT76_CLEAN_Q_MAX];
++	atomic_t clean_re_reads[__MT76_CLEAN_Q_MAX];
++	atomic_t clean_done[__MT76_CLEAN_Q_MAX];
++	atomic_t clean_skipped[__MT76_CLEAN_Q_MAX];
++
++	/* T3: writeback walk and index completions per queue */
++	atomic_t clean_done_walk[__MT76_CLEAN_Q_MAX];
++	atomic_t clean_done_idx[__MT76_CLEAN_Q_MAX];
++	atomic_t walk_empty[__MT76_CLEAN_Q_MAX];
++	atomic_t fallback_progress[__MT76_CLEAN_Q_MAX];
++	atomic_t desc_reads[__MT76_CLEAN_Q_MAX];
++
++	/* T3: Mode 1 Shadow mode */
++	atomic_t shadow_missing;
++	atomic_t shadow_missing_after_next;
++	atomic_t shadow_ooo;
++	atomic_t shadow_unverifiable;
++	atomic_t shadow_missing_overflow;
++	atomic_t shadow_early;
++	int shadow_max_gap;
++
++	/* T3: Mode 3 Verify mode and fallback tracking */
++	atomic_t walk_behind;
++	atomic_t walk_ahead;
++	int walk_max_behind;
++	int walk_max_ahead;
++	atomic_t index_behind;
++	int index_max_behind;
++	atomic_t index_ambiguous;
++
++	/* mt76x02_poll_tx / mt7603_poll_tx */
++	atomic_t tx_napi_polls;
++	atomic_t tx_napi_pass1_done;
++	atomic_t tx_napi_pass2_done;
++
++	/* mt76x02_mac_poll_tx_status */
++	atomic_t stat_poll_calls[__MT76_STAT_CALLER_MAX];
++	atomic_t stat_valid_reads;
++	atomic_t stat_empty_reads;
++	atomic_t stat_skb_requested;
++	atomic_t stat_skb_matched;
++	atomic_t stat_skb_timeouts;
++	atomic_t stat_poll_complete_skipped;
++	atomic_t stat_poll_napi_skipped;
++
++	/* mt76x02_tx_hang / mt7603_tx_hang */
++	atomic_t tx_hang_idx_reads;
++
++	/* Interrupts handled */
++	atomic_t irq_handled;
++
++	/* mt76_mmio_rr */
++	atomic_t mmio_rr_total;
++};
++
+ enum mt76_phy_type {
+ 	MT_PHY_TYPE_CCK,
+ 	MT_PHY_TYPE_OFDM,
+@@ -1052,6 +1135,8 @@ struct mt76_dev {
+ 	atomic_t bus_hung;
+ 	bool tx_no_reread;
+ 	u8 tx_wb_mode;
++
++	struct mt76_tx_reads tx_reads;
+ };
+ 
+ /* per-phy stats.  */
+@@ -1390,6 +1475,38 @@ static inline int mt76_init_mcu_queue(struct mt76_dev *dev, int qid, int idx,
+ 	return 0;
+ }
+ 
++static inline enum mt76_tx_cleanup_qid
++mt76_get_cleanup_qid(struct mt76_dev *dev, struct mt76_queue *q)
++{
++	int i;
++
++	if (!q)
++		return MT76_CLEAN_Q_OTHER;
++
++	for (i = 0; i < ARRAY_SIZE(dev->q_mcu); i++)
++		if (dev->q_mcu[i] == q)
++			return MT76_CLEAN_Q_MCU;
++
++	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
++		struct mt76_phy *phy = dev->phys[i];
++
++		if (!phy)
++			continue;
++		if (phy->q_tx[MT_TXQ_VO] == q)
++			return MT76_CLEAN_Q_VO;
++		if (phy->q_tx[MT_TXQ_VI] == q)
++			return MT76_CLEAN_Q_VI;
++		if (phy->q_tx[MT_TXQ_BE] == q)
++			return MT76_CLEAN_Q_BE;
++		if (phy->q_tx[MT_TXQ_BK] == q)
++			return MT76_CLEAN_Q_BK;
++		if (phy->q_tx[MT_TXQ_PSD] == q)
++			return MT76_CLEAN_Q_PSD;
++	}
++
++	return MT76_CLEAN_Q_OTHER;
++}
++
+ static inline struct mt76_phy *
+ mt76_dev_phy(struct mt76_dev *dev, u8 phy_idx)
+ {
+diff --git a/mt7603/core.c b/mt7603/core.c
+index ee2b438e..de753e07 100644
+--- a/mt7603/core.c
++++ b/mt7603/core.c
+@@ -74,6 +74,7 @@ irqreturn_t mt7603_irq_handler(int irq, void *dev_instance)
+ 		napi_schedule(&dev->mt76.napi[1]);
+ 	}
+ 
++	atomic_inc(&dev->mt76.tx_reads.irq_handled);
+ 	return IRQ_HANDLED;
+ }
+ 
+diff --git a/mt7603/dma.c b/mt7603/dma.c
+index da27314e..150084e2 100644
+--- a/mt7603/dma.c
++++ b/mt7603/dma.c
+@@ -166,21 +166,25 @@ mt7603_init_rx_queue(struct mt7603_dev *dev, struct mt76_queue *q,
+ static int mt7603_poll_tx(struct napi_struct *napi, int budget)
+ {
+ 	struct mt7603_dev *dev;
+-	int i;
++	int i, pass1 = 0, pass2 = 0;
+ 
+ 	dev = container_of(napi, struct mt7603_dev, mt76.tx_napi);
+ 	dev->tx_dma_check = 0;
+ 
+-	mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[MT_MCUQ_WM], false);
++	pass1 += mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[MT_MCUQ_WM], false);
+ 	for (i = MT_TXQ_PSD; i >= 0; i--)
+-		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], false);
++		pass1 += mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], false);
+ 
+ 	if (napi_complete_done(napi, 0))
+ 		mt7603_irq_enable(dev, mt7603_tx_done_int(dev));
+ 
+-	mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[MT_MCUQ_WM], false);
++	pass2 += mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[MT_MCUQ_WM], false);
+ 	for (i = MT_TXQ_PSD; i >= 0; i--)
+-		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], false);
++		pass2 += mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], false);
++
++	atomic_inc(&dev->mt76.tx_reads.tx_napi_polls);
++	atomic_add(pass1, &dev->mt76.tx_reads.tx_napi_pass1_done);
++	atomic_add(pass2, &dev->mt76.tx_reads.tx_napi_pass2_done);
+ 
+ 	mt7603_mac_sta_poll(dev);
+ 
+diff --git a/mt7603/mac.c b/mt7603/mac.c
+index 204522f3..282ce819 100644
+--- a/mt7603/mac.c
++++ b/mt7603/mac.c
+@@ -1566,6 +1566,7 @@ static bool mt7603_tx_hang(struct mt7603_dev *dev)
+ 			continue;
+ 
+ 		prev_dma_idx = dev->tx_dma_idx[i];
++		atomic_inc(&dev->mt76.tx_reads.tx_hang_idx_reads);
+ 		dma_idx = readl(&q->regs->dma_idx);
+ 		dev->tx_dma_idx[i] = dma_idx;
+ 
+diff --git a/mt76x02_mac.c b/mt76x02_mac.c
+index 8d7759c1..a0b37b77 100644
+--- a/mt76x02_mac.c
++++ b/mt76x02_mac.c
+@@ -600,8 +600,10 @@ void mt76x02_send_tx_status(struct mt76x02_dev *dev,
+ 		if (mt76_is_skb_pktid(stat->pktid))
+ 			status.skb = mt76_tx_status_skb_get(mdev, wcid,
+ 							    stat->pktid, &list);
+-		if (status.skb)
++		if (status.skb) {
++			atomic_inc(&dev->mt76.tx_reads.stat_skb_matched);
+ 			status.info = IEEE80211_SKB_CB(status.skb);
++		}
+ 	}
+ 
+ 	if (!status.skb && !(stat->pktid & MT_PACKET_ID_HAS_RATE)) {
+@@ -904,15 +906,19 @@ int mt76x02_mac_process_rx(struct mt76x02_dev *dev, struct sk_buff *skb,
+ 	return mt76x02_mac_process_rate(dev, status, rate);
+ }
+ 
+-void mt76x02_mac_poll_tx_status(struct mt76x02_dev *dev, bool irq)
++void mt76x02_mac_poll_tx_status(struct mt76x02_dev *dev,
++				enum mt76x02_tx_status_caller caller)
+ {
+ 	struct mt76x02_tx_status stat = {};
++	bool irq = (caller == MT76_STAT_CALLER_IRQ);
+ 	u8 update = 1;
+ 	bool ret;
+ 
+ 	if (!test_bit(MT76_STATE_RUNNING, &dev->mphy.state))
+ 		return;
+ 
++	atomic_inc(&dev->mt76.tx_reads.stat_poll_calls[caller]);
++
+ 	trace_mac_txstat_poll(dev);
+ 
+ 	while (!irq || !kfifo_is_full(&dev->txstatus_fifo)) {
+@@ -922,8 +928,12 @@ void mt76x02_mac_poll_tx_status(struct mt76x02_dev *dev, bool irq)
+ 		ret = mt76x02_mac_load_tx_status(dev, &stat);
+ 		spin_unlock(&dev->txstatus_fifo_lock);
+ 
+-		if (!ret)
++		if (!ret) {
++			atomic_inc(&dev->mt76.tx_reads.stat_empty_reads);
+ 			break;
++		}
++
++		atomic_inc(&dev->mt76.tx_reads.stat_valid_reads);
+ 
+ 		if (!irq) {
+ 			mt76x02_send_tx_status(dev, &stat, &update);
+@@ -958,7 +968,9 @@ void mt76x02_tx_complete_skb(struct mt76_dev *mdev, struct mt76_queue_entry *e)
+ 	}
+ 
+ 	if (poll)
+-		mt76x02_mac_poll_tx_status(dev, false);
++		mt76x02_mac_poll_tx_status(dev, MT76_STAT_CALLER_TX_COMPLETE);
++	else
++		atomic_inc(&dev->mt76.tx_reads.stat_poll_complete_skipped);
+ 
+ 	trace_mac_txdone(mdev, txwi->wcid, txwi->pktid);
+ 
+diff --git a/mt76x02_mac.h b/mt76x02_mac.h
+index 778454ac..f671a61c 100644
+--- a/mt76x02_mac.h
++++ b/mt76x02_mac.h
+@@ -193,7 +193,8 @@ void mt76x02_mac_setaddr(struct mt76x02_dev *dev, const u8 *addr);
+ void mt76x02_mac_write_txwi(struct mt76x02_dev *dev, struct mt76x02_txwi *txwi,
+ 			    struct sk_buff *skb, struct mt76_wcid *wcid,
+ 			    struct ieee80211_sta *sta, int len);
+-void mt76x02_mac_poll_tx_status(struct mt76x02_dev *dev, bool irq);
++void mt76x02_mac_poll_tx_status(struct mt76x02_dev *dev,
++				enum mt76x02_tx_status_caller caller);
+ void mt76x02_tx_complete_skb(struct mt76_dev *mdev, struct mt76_queue_entry *e);
+ void mt76x02_update_channel(struct mt76_phy *mphy);
+ void mt76x02_mac_work(struct work_struct *work);
+diff --git a/mt76x02_mmio.c b/mt76x02_mmio.c
+index f52cc40d..b2b949c0 100644
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -171,42 +171,52 @@ static void mt76x02_tx_worker(struct mt76_worker *w)
+ 
+ 	dev = container_of(w, struct mt76x02_dev, mt76.tx_worker);
+ 
+-	mt76x02_mac_poll_tx_status(dev, false);
++	mt76x02_mac_poll_tx_status(dev, MT76_STAT_CALLER_WORKER);
+ 	mt76x02_process_tx_status_fifo(dev);
+ 
+ 	mt76_txq_schedule_all(&dev->mphy);
+ }
+ 
+-static void mt76x02_clean_tx_queue(struct mt76x02_dev *dev, struct mt76_queue *q)
++static int mt76x02_clean_tx_queue(struct mt76x02_dev *dev, struct mt76_queue *q)
+ {
+ 	if (!q)
+-		return;
++		return 0;
+ 
+-	if (READ_ONCE(dev->tx_skip_idle) && !READ_ONCE(q->queued))
+-		return;
++	if (READ_ONCE(dev->tx_skip_idle) && !READ_ONCE(q->queued)) {
++		enum mt76_tx_cleanup_qid qid = mt76_get_cleanup_qid(&dev->mt76, q);
++
++		atomic_inc(&dev->mt76.tx_reads.clean_skipped[qid]);
++		return 0;
++	}
+ 
+-	mt76_queue_tx_cleanup(dev, q, false);
++	return mt76_queue_tx_cleanup(dev, q, false);
+ }
+ 
+ static int mt76x02_poll_tx(struct napi_struct *napi, int budget)
+ {
+ 	struct mt76x02_dev *dev = container_of(napi, struct mt76x02_dev,
+ 					       mt76.tx_napi);
+-	int i;
++	int i, pass1 = 0, pass2 = 0;
+ 
+ 	if (!READ_ONCE(dev->tx_skip_napi_stat))
+-		mt76x02_mac_poll_tx_status(dev, false);
++		mt76x02_mac_poll_tx_status(dev, MT76_STAT_CALLER_NAPI);
++	else
++		atomic_inc(&dev->mt76.tx_reads.stat_poll_napi_skipped);
+ 
+-	mt76x02_clean_tx_queue(dev, dev->mt76.q_mcu[MT_MCUQ_WM]);
++	pass1 += mt76x02_clean_tx_queue(dev, dev->mt76.q_mcu[MT_MCUQ_WM]);
+ 	for (i = MT_TXQ_PSD; i >= 0; i--)
+-		mt76x02_clean_tx_queue(dev, dev->mphy.q_tx[i]);
++		pass1 += mt76x02_clean_tx_queue(dev, dev->mphy.q_tx[i]);
+ 
+ 	if (napi_complete_done(napi, 0))
+ 		mt76x02_irq_enable(dev, mt76x02_tx_done_int(dev));
+ 
+-	mt76x02_clean_tx_queue(dev, dev->mt76.q_mcu[MT_MCUQ_WM]);
++	pass2 += mt76x02_clean_tx_queue(dev, dev->mt76.q_mcu[MT_MCUQ_WM]);
+ 	for (i = MT_TXQ_PSD; i >= 0; i--)
+-		mt76x02_clean_tx_queue(dev, dev->mphy.q_tx[i]);
++		pass2 += mt76x02_clean_tx_queue(dev, dev->mphy.q_tx[i]);
++
++	atomic_inc(&dev->mt76.tx_reads.tx_napi_polls);
++	atomic_add(pass1, &dev->mt76.tx_reads.tx_napi_pass1_done);
++	atomic_add(pass2, &dev->mt76.tx_reads.tx_napi_pass2_done);
+ 
+ 	mt76_worker_schedule(&dev->mt76.tx_worker);
+ 
+@@ -345,7 +355,7 @@ irqreturn_t mt76x02_irq_handler(int irq, void *dev_instance)
+ 	}
+ 
+ 	if (intr & MT_INT_TX_STAT)
+-		mt76x02_mac_poll_tx_status(dev, true);
++		mt76x02_mac_poll_tx_status(dev, MT76_STAT_CALLER_IRQ);
+ 
+ 	if (intr & (MT_INT_TX_STAT | MT_INT_TX_DONE_ALL | MT_INT_TXDELAYINT))
+ 		napi_schedule(&dev->mt76.tx_napi);
+@@ -353,6 +363,7 @@ irqreturn_t mt76x02_irq_handler(int irq, void *dev_instance)
+ 	if (intr & MT_INT_GPTIMER)
+ 		tasklet_schedule(&dev->dfs_pd.dfs_tasklet);
+ 
++	atomic_inc(&dev->mt76.tx_reads.irq_handled);
+ 	return IRQ_HANDLED;
+ }
+ EXPORT_SYMBOL_GPL(mt76x02_irq_handler);
+@@ -430,6 +441,7 @@ static bool mt76x02_tx_hang(struct mt76x02_dev *dev)
+ 		q = dev->mphy.q_tx[i];
+ 
+ 		prev_dma_idx = dev->mt76.tx_dma_idx[i];
++		atomic_inc(&dev->mt76.tx_reads.tx_hang_idx_reads);
+ 		dma_idx = readl(&q->regs->dma_idx);
+ 		dev->mt76.tx_dma_idx[i] = dma_idx;
+ 
+diff --git a/tx.c b/tx.c
+index cd129f6f..37af8ce4 100644
+--- a/tx.c
++++ b/tx.c
+@@ -161,6 +161,7 @@ mt76_tx_status_skb_add(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 
+ 	cb->wcid = wcid->idx;
+ 	cb->pktid = pid;
++	atomic_inc(&dev->tx_reads.stat_skb_requested);
+ 
+ 	if (list_empty(&wcid->list))
+ 		list_add_tail(&wcid->list, &dev->wcid_list);
+@@ -202,6 +203,7 @@ mt76_tx_status_skb_get(struct mt76_dev *dev, struct mt76_wcid *wcid, int pktid,
+ 		 * and stop waiting for TXS callback.
+ 		 */
+ 		idr_remove(&wcid->pktid, cb->pktid);
++		atomic_inc(&dev->tx_reads.stat_skb_timeouts);
+ 		__mt76_tx_status_skb_done(dev, skb, MT_TX_CB_TXS_FAILED |
+ 						    MT_TX_CB_TXS_DONE, list);
+ 	}

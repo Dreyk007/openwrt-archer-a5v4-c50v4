@@ -68,7 +68,8 @@ int main(int argc, char **argv)
 		}
 	}
 	t = now() - t0;
+	/* in double: sent * size * 8 overflows a 32-bit unsigned long after ~4.3 Gbit */
 	printf("sent %lu datagrams of %d bytes in %.2f s: %.1f Mbit/s, %.0f per s, %lu errors\n",
-	       sent, size, t, sent * size * 8 / t / 1e6, sent / t, err);
+	       sent, size, t, (double)sent * size * 8 / t / 1e6, sent / t, err);
 	return 0;
 }

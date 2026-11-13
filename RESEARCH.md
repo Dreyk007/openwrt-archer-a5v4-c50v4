@@ -138,7 +138,7 @@ Each variant below changes one thing of the packages step; the difference is tha
 | without `rpcd-mod-rrdns` | — | ≈ −4 | the apk is 4 KiB; a dependency of the `luci-light` collection, so it stays (the bar was 8 KiB) |
 | PIE off for the network-facing daemons | 3649 | −104 | wpad, dnsmasq, pppd, dropbear, procd, rpcd, ubus and uhttpd without PIE are 16–26 % smaller (wpad 775 → 612 KB, dnsmasq 222 → 180 KB): about 320 KB less code in RAM while they run; their code addresses are then no longer randomised |
 
-WireGuard costs 30 KiB of kernel flash and 87 KiB of kernel RAM (built in) and about 41 KiB of programs (`wireguard-tools` 27, `luci-proto-wireguard` 12, `resolveip` 2 KiB as apk).
+WireGuard costs 30 KiB of kernel flash and 87 KiB of kernel RAM (built in) and about 41 KiB of programs (`wireguard-tools` 27, `luci-proto-wireguard` 12, `resolveip` 2 KiB as apk). L2TP for the WAN (added on 2026-11-13: `xl2tpd`, `ppp-mod-pppol2tp`, `kmod-pppol2tp`, `kmod-l2tp`) costs +64 KiB of the image (+61 KiB of `root.squashfs`, Free 1279 → 1215 KiB) and +2 KiB of kernel RAM (against the same build without L2TP, 0 user RAM at idle; [section 13](#13-vpn-wireguard-and-amneziawg)).
 
 * busybox has the `ip` applet in its default configuration, but `BUSYBOX_CONFIG_IP` exists in `.config` only with `CONFIG_BUSYBOX_CUSTOM`; without it `wireguard-tools` (`+!BUSYBOX_CONFIG_IP:ip`) pulled `ip-tiny`. netifd's WireGuard handler calls `ip -br link show`, which busybox does not know; it then adds the link, which is what the check is for. The QEMU bench passes the WireGuard checks with busybox `ip`.
 * `zlib` came back with the default options of libcurl and left with them.
@@ -401,7 +401,7 @@ OpenWrt 25.12.6 pins mt76 at `39c960c3` (`PKG_SOURCE_DATE:=2026-03-19`, `PKG_REL
 
 **The WAN firewall** (2026-11-02, as in openwrt-ax3200). The WAN zone and the global defaults (interfaces in no zone) drop instead of reject: a closed port gives no answer at all. Only a policy still at the stock `REJECT` changes, so that a configuration kept from another firmware keeps its own choice. Ping from the WAN stays answered (OpenWrt's `Allow-Ping`, kept by openwrt-ax3200 too): what the WAN can reach is decided by the open ports, and there are none; ICMP errors that TCP needs (fragmentation needed) belong to existing connections and pass as related traffic either way; ping lets the ISP and the owner check the line. Also from openwrt-ax3200 (2026-11-02): `drop_invalid` (without it, packets that conntrack marks invalid leave the LAN through the WAN without NAT, with their LAN source address) and SSH only on the addresses of the LAN interface (`dropbear` `Interface 'lan'`); through WireGuard the router stays reachable at 192.168.1.1, which the bench checks. dropbear then starts only once the LAN has its address: on the bench 3–6 s after `lan` is up, instead of before it.
 
-Not present anyway: KASLR and `VMAP_STACK` (off in the generic configuration), `STRICT_KERNEL_RWX` and kernel stack offset randomisation (not supported on MIPS); seccomp is left out ([section 10](#10-what-the-image-leaves-out)).
+Not present anyway: KASLR and `VMAP_STACK` (off in the generic configuration), `STRICT_KERNEL_RWX` and kernel stack offset randomisation (not supported on MIPS); seccomp is left out ([section 10](#10-what-the-image-leaves-out)). Patch `977` (taken ahead of Linux 6.12.113 for CVE-2026-98432, `kfree_rcu` on shared IPv4 options in TCP SYN handling) fixes a race that is practically unreachable on this CPU because the MT7628 has one core, no `SMP`, `PREEMPT_NONE` and no `MPTCP`, and was taken only because the fix is two lines.
 
 Cost: turning the kernel hardening off (usercopy, freelist, stack protector) saved 9 KiB of flash and 25 KiB of RAM in the test builds. On the AX3200 (aarch64, a partly different set) it saved ~5 % CPU per Gbit/s from LAN to Wi-Fi and nothing in the other direction, at the same throughput.
 
@@ -445,7 +445,7 @@ Decided on 2026-11-01. Against the official image of 25.12.6 for this router (th
 
 **Kept:** the hardening ([section 9](#9-kernel-hardening)), bridge VLAN filtering and the xattrs of jffs2 and tmpfs (above). **Not added:** zram ([section 11](#11-zram)).
 
-**Added to the official set:** `luci-light` pages for the firewall, PPP and WireGuard with `luci-i18n-base-ru` and `luci-i18n-firewall-ru`; `kmod-wireguard` (a module since 2026-11-03, loaded with a tunnel), `wireguard-tools`, `luci-proto-wireguard` (with `resolveip`); since 2026-11-03 `kmod-amneziawg`, `amneziawg-tools`, `luci-proto-amneziawg` with Russian ([section 13](#13-vpn-wireguard-and-amneziawg)) and `https-dns-proxy`, `luci-app-https-dns-proxy` with Russian ([section 14](#14-encrypted-dns-doh)); `travelmate`, `luci-app-travelmate`, `luci-i18n-travelmate-ru`, `iwinfo`, `curl` (libcurl over mbedtls, without zlib, FTP and `file://`; with HTTP/2 and `libnghttp2` since 2026-11-03, for DoH, [section 14](#14-encrypted-dns-doh)); `igmpproxy`, `udpxy`, `luci-app-udpxy`, `luci-i18n-udpxy-ru` until 2026-11-06 (IPTV, above). The packages step put them in on 2026-11-01 ([section 2](#2-size-of-the-programs)); `rpcd-mod-rrdns` stays (4 KiB, a dependency of `luci-light`).
+**Added to the official set:** `luci-light` pages for the firewall, PPP and WireGuard with `luci-i18n-base-ru` and `luci-i18n-firewall-ru`; `kmod-wireguard` (a module since 2026-11-03, loaded with a tunnel), `wireguard-tools`, `luci-proto-wireguard` (with `resolveip`); since 2026-11-03 `kmod-amneziawg`, `amneziawg-tools`, `luci-proto-amneziawg` with Russian ([section 13](#13-vpn-wireguard-and-amneziawg)) and `https-dns-proxy`, `luci-app-https-dns-proxy` with Russian ([section 14](#14-encrypted-dns-doh)); `travelmate`, `luci-app-travelmate`, `luci-i18n-travelmate-ru`, `iwinfo`, `curl` (libcurl over mbedtls, without zlib, FTP and `file://`; with HTTP/2 and `libnghttp2` since 2026-11-03, for DoH, [section 14](#14-encrypted-dns-doh)); since 2026-11-13 WAN L2TP (`xl2tpd`, `ppp-mod-pppol2tp`, `kmod-pppol2tp`, `kmod-l2tp`; +64 KiB of the image, +61 KiB of `root.squashfs`, +2 KiB of kernel RAM, [section 13](#13-vpn-wireguard-and-amneziawg)), because some ISPs connect over L2TP and the image has no package manager (`luci-proto-ppp` and `kmod-udptunnel4/6` were already in the image); `igmpproxy`, `udpxy`, `luci-app-udpxy`, `luci-i18n-udpxy-ru` until 2026-11-06 (IPTV, above). The packages step put them in on 2026-11-01 ([section 2](#2-size-of-the-programs)); `rpcd-mod-rrdns` stays (4 KiB, a dependency of `luci-light`).
 
 ## 11. zram
 
@@ -816,7 +816,8 @@ The tools of these tests are in `tests/router` (`autolab.sh`, `run24.sh`, `csa_r
 
 * **WireGuard:** `kmod-wireguard` loses its `AUTOLOAD` (`package/kernel/linux/modules/netsupport.mk`). netifd creates the interface with `ip link add … type wireguard`, the kernel asks for `rtnl-link-wireguard`, and OpenWrt's `modprobe` loads the module. The ChaCha20 and Poly1305 of MIPS come with `kmod-crypto-lib-chacha20` and `-poly1305` (`chacha-mips.ko`, `poly1305-mips.ko`) instead of being built in.
 * **AmneziaWG:** its protocol handler (`amneziawg.sh`) runs `modprobe amneziawg` itself.
-* **The UDP tunnel code** both use (`NET_UDP_TUNNEL`, `kmod-udptunnel4/6`) stays built in.
+* **L2TP (2026-11-13):** `kmod-l2tp` and `kmod-pppol2tp` lose their `AUTOLOAD` (`netsupport.mk`), and `feeds-patches/packages/0003` makes `boot()` in `xl2tpd.init` a no-op so neither `xl2tpd` nor the kernel modules consume RAM on routers without an L2TP interface. When an L2TP WAN comes up, `/lib/netifd/proto/l2tp.sh` starts `xl2tpd` itself; when `xl2tpd` opens a `PPPoL2TP` socket, the kernel asks for `net-pf-24-proto-1` (`MODALIAS` of `l2tp_ppp`) and `modprobe` loads `l2tp_ppp` and `l2tp_core`. An LNS server that wants `xl2tpd` running from boot needs `/etc/init.d/xl2tpd start` in `/etc/rc.local`. `xl2tpd` 1.3.18 is built with `-std=gnu17` (`0002`) under GCC 15.
+* **The UDP tunnel code** they share (`NET_UDP_TUNNEL`, `kmod-udptunnel4/6`) stays built in.
 
 **AmneziaWG** comes from the feed [awg-openwrt](https://github.com/Slava-Shchipunov/awg-openwrt), pinned in `feeds.conf.default` to `03b62269e2` (AmneziaWG 3.1):
 
@@ -832,6 +833,9 @@ The tools of these tests are in `tests/router` (`autolab.sh`, `run24.sh`, `csa_r
 |---|---|---|
 | AmneziaWG | `amneziawg-tools` 43, `kmod-amneziawg` 44, `luci-proto-amneziawg` 29, Russian 4 | 120 |
 | WireGuard as a module | `kmod-wireguard` 37, the crypto libraries 17, in `root.squashfs` instead of the kernel | 54 |
+| WAN L2TP | `xl2tpd` 48, `kmod-l2tp` 16, `kmod-pppol2tp` 9, `ppp-mod-pppol2tp` 5 | 78 |
+
+In the image (against the same build without L2TP), WAN L2TP costs +64 KiB (+61 KiB of `root.squashfs`, Free 1279 → 1215 KiB) and +2 KiB of kernel RAM.
 
 **Measured (2026-11-03, QEMU bench):**
 
@@ -839,9 +843,16 @@ The tools of these tests are in `tests/router` (`autolab.sh`, `run24.sh`, `csa_r
 * AmneziaWG without obfuscation completes a handshake with a WireGuard peer, and SSH works through it;
 * two AmneziaWG interfaces with obfuscation (`jc 4`, `jmin 8`, `jmax 80`, `s1 15`, `s2 30`, `h1`–`h4`) complete a handshake *(bench)*.
 
+**Measured for L2TP (2026-11-13, QEMU bench, 64 MiB):**
+
+* at boot and before an L2TP interface is configured, no `xl2tpd` process runs and `l2tp_ppp`/`l2tp_core` are not loaded (`MemAvailable` 15 828 KiB at L2TP idle);
+* when an L2TP WAN interface (`proto=l2tp`) connects to the bench LNS (`192.0.2.1`), `l2tp_ppp` and `l2tp_core` load automatically, `xl2tpd` logs `Using l2tp kernel support.` and pings pass to `10.65.0.1` over `l2tp-l2tp`;
+* `xl2tpd` takes 108/960 KiB (`RssAnon`/`VmRSS`) and `MemAvailable` drops 15 828 → 14 616 KiB (−1 212 KiB including `xl2tpd`, `pppd` and modules); after `ifdown l2tp` the `10.65.0.x` address leaves *(bench)*;
+* across a reboot with L2TP saved in `/etc/config/network`, `l2tp.sh` starts `xl2tpd` on demand during boot (`S60xl2tpd boot()` is a no-op), `l2tp_ppp`/`l2tp_core` load, `xl2tpd` logs `Using l2tp kernel support.`, and `10.65.0.x` answers ping 1 s after SSH *(bench)*.
+
 Throughput on the router is still to be measured ([TODO.md](TODO.md#checks-and-measurements)).
 
-**Decision (2026-11-03):** both, as modules loaded with a tunnel.
+**Decision (2026-11-03; L2TP 2026-11-13):** WireGuard, AmneziaWG and WAN L2TP, all with modules (and `xl2tpd`) loaded on demand with a tunnel.
 
 ## 14. Encrypted DNS (DoH)
 

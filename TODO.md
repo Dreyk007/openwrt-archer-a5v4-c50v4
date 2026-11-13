@@ -65,8 +65,10 @@ The plan decided on 2026-11-01. In this order; every step records its size cost
       starts in WPA2/WPA3 mode, 2.4 GHz in WPA2: a device that cannot join 5 GHz gets WPA2 there
       in LuCI; SSH only at the LAN address, also through WireGuard), what the
       build changes and leaves out ([RESEARCH.md section 10](RESEARCH.md#10-what-the-image-leaves-out)),
-      flash and RAM, the packages, setting up WISP, WireGuard and AmneziaWG (remote access through
-      a VPS, full tunnel); no IPTV over multicast (the ISP's own router or set-top box; a set-top
+      flash and RAM, the packages, setting up WISP, WAN L2TP (supported in the image; set up in
+      LuCI under Network → Interfaces by adding an interface with protocol `L2TP`, server, user name
+      and password in the `wan` zone, alongside the DHCP WAN underlay), WireGuard and AmneziaWG
+      (remote access through a VPS, full tunnel); no IPTV over multicast (the ISP's own router or set-top box; a set-top
       box on its own VLAN works with the switch settings); DoH: on by default, ISP pages that rely on its DNS do not open,
       no name resolves while DoH is unreachable, and how to turn it off
       ([RESEARCH.md section 14](RESEARCH.md#14-encrypted-dns-doh)); GRO off and threaded NAPI: what
@@ -270,6 +272,8 @@ sources*).
   for the LAN, AmneziaWG with and without obfuscation; no DNS leak in the full tunnel. WireGuard in
   states A and U done on 2026-11-06 with the router's own iperf3 (A 27.7 up / 23.1 down, U 29.8 /
   24.7 Mbit/s); AmneziaWG on a release image, since the debug image leaves it out.
+- **L2TP on the WAN:** check against a real ISP LNS (a user's report — throughput, reconnects,
+  PPPoL2TP kernel forwarding and flow offloading).
 - **Boot time** ([RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router)): the boot is bound by
   reading the flash, and odhcpd adds about 30 MiB of reads while the radios are set up. Candidates,
   each to be measured with the same reboots (`/proc/diskstats` of `mtdblock4`, WAN and AP times):
@@ -460,6 +464,9 @@ Postponed by the owner on 2026-11-07, with PPPoE on the router (the bench covers
 ## Next releases
 
 - **25.12.7 (Linux 6.12.113).** Merge the tag ([UPGRADING.md section 2](UPGRADING.md#2-minor-release-eg-25126--25127)).
-  This build does not use the official kmods, so the kernel version does not have to match a
+  Drop the six cherry-picks taken ahead of 25.12.7 (`ca-certificates` `4a686570eb`, `musl`
+  `1684a761a3`, `dnsmasq` `514fad5218`, `libubox` `6c57f7cd04`, `uhttpd` `5c334c12e2` and
+  `d4cb702258`) and kernel patch `977` (Linux 6.12.113 already has them). Kernel patch `978`
+  (`pskb_expand_head()`, net-next `c7d8bc3dd511`) stays until the kernel takes it. This build does not use the official kmods, so the kernel version does not have to match a
   release; still, merge release tags, and cherry-pick single fixes of `openwrt-25.12` in between.
   Check the mt76 patches against the new release and the size budget.

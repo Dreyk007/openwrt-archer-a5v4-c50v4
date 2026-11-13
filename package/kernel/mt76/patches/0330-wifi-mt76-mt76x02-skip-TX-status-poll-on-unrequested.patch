@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Thu, 12 Nov 2026 23:02:00 +0200
+Subject: [PATCH] wifi: mt76: mt76x02: skip TX status poll on unrequested
+ completions
+
+mt76x02_tx_complete_skb() calls mt76x02_mac_poll_tx_status() for every
+completed frame carrying a TXWI, performing at least two PCIe MMIO reads
+(MT_TX_STAT_FIFO_EXT and MT_TX_STAT_FIFO, ~2.7 us total) per frame even
+when the frame never requested TX status or already received it.
+
+Add bit 2 (MT76X02_TX_OPT_SKIP_COMPLETE_STAT, 4) to tx_opt, on by
+default, read with READ_ONCE() in mt76x02_tx_complete_skb(). When set,
+status polling is skipped if !mt76_is_skb_pktid(txwi->pktid) or
+(cb->flags & MT_TX_CB_TXS_DONE).
+
+Frames that actually await TX status (an active software packet ID with
+MT_TX_CB_TXS_DONE unset) still trigger immediate polling, preserving
+status delivery latency; ordinary rate-control hardware statuses continue
+to arrive via MT_INT_TX_STAT and the TX worker.
+
+Paired with skipping the start-of-NAPI status poll on MT7612E,
+router-to-client UDP throughput increased by +4% (22.2 vs 21.3 Mbit/s),
+while 90 Mbit/s TCP download stayed within the measurement spread. Over
+a 24.58-hour site run with all four tx_opt bits active and an
+active-traffic channel-switch test (52->36->52: 4 switches with the
+bits on and 4 without, same result in both), TX status timeouts were
+0.082% vs 0.093% without the patches with zero TX hangs, zero resets,
+and all 8 switches finishing in 1.83-2.02 s.
+
+Writing 0 to the mt76x02_lib module parameter tx_opt restores the stock
+behaviour.
+---
+ mt76x02.h      |  4 +++-
+ mt76x02_mac.c  | 15 +++++++++++++--
+ mt76x02_mmio.c |  2 +-
+ 3 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/mt76x02.h b/mt76x02.h
+index 5e69f8d9..17486de7 100644
+--- a/mt76x02.h
++++ b/mt76x02.h
+@@ -151,8 +151,10 @@ struct mt76x02_dev {
+ 
+ #define MT76X02_TX_OPT_SKIP_IDLE		BIT(0)
+ #define MT76X02_TX_OPT_NO_REREAD		BIT(1)
++#define MT76X02_TX_OPT_SKIP_COMPLETE_STAT	BIT(2)
+ #define MT76X02_TX_OPT_DEFAULT			\
+-	(MT76X02_TX_OPT_SKIP_IDLE | MT76X02_TX_OPT_NO_REREAD)
++	(MT76X02_TX_OPT_SKIP_IDLE | MT76X02_TX_OPT_NO_REREAD | \
++	 MT76X02_TX_OPT_SKIP_COMPLETE_STAT)
+ 
+ extern unsigned int tx_opt;
+ extern struct ieee80211_rate mt76x02_rates[12];
+diff --git a/mt76x02_mac.c b/mt76x02_mac.c
+index 457767bb..a42af2d7 100644
+--- a/mt76x02_mac.c
++++ b/mt76x02_mac.c
+@@ -938,6 +938,7 @@ void mt76x02_tx_complete_skb(struct mt76_dev *mdev, struct mt76_queue_entry *e)
+ {
+ 	struct mt76x02_dev *dev = container_of(mdev, struct mt76x02_dev, mt76);
+ 	struct mt76x02_txwi *txwi;
++	bool poll = true;
+ 	u8 *txwi_ptr;
+ 
+ 	if (!e->txwi) {
+@@ -945,10 +946,20 @@ void mt76x02_tx_complete_skb(struct mt76_dev *mdev, struct mt76_queue_entry *e)
+ 		return;
+ 	}
+ 
+-	mt76x02_mac_poll_tx_status(dev, false);
+-
+ 	txwi_ptr = mt76_get_txwi_ptr(mdev, e->txwi);
+ 	txwi = (struct mt76x02_txwi *)txwi_ptr;
++
++	if (READ_ONCE(tx_opt) & MT76X02_TX_OPT_SKIP_COMPLETE_STAT) {
++		struct mt76_tx_cb *cb = mt76_tx_skb_cb(e->skb);
++
++		if (!mt76_is_skb_pktid(txwi->pktid) ||
++		    (cb->flags & MT_TX_CB_TXS_DONE))
++			poll = false;
++	}
++
++	if (poll)
++		mt76x02_mac_poll_tx_status(dev, false);
++
+ 	trace_mac_txdone(mdev, txwi->wcid, txwi->pktid);
+ 
+ 	mt76_tx_complete_skb(mdev, e->wcid, e->skb);
+diff --git a/mt76x02_mmio.c b/mt76x02_mmio.c
+index c85c8db8..bb246b11 100644
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -29,7 +29,7 @@ MODULE_PARM_DESC(delay_int,
+ unsigned int tx_opt = MT76X02_TX_OPT_DEFAULT;
+ module_param(tx_opt, uint, 0644);
+ MODULE_PARM_DESC(tx_opt,
+-		 "5 GHz TX path optimizations (bitmask): 1=skip idle queues, 2=skip catch-up index re-read; 0: off; default 0x3");
++		 "5 GHz TX path optimizations (bitmask): 1=skip idle queues, 2=skip catch-up index re-read, 4=skip status poll on unrequested completions; 0: off; default 0x7");
+ 
+ /* The interrupt of the main RX ring; the MCU ring keeps its own */
+ static u32 mt76x02_rx_main_int(struct mt76x02_dev *dev)

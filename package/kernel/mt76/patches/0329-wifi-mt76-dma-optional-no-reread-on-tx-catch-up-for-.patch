@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Thu, 12 Nov 2026 23:01:00 +0200
+Subject: [PATCH] wifi: mt76: dma: optional no reread on tx catch-up for
+ mt76x02
+
+When mt76_dma_tx_cleanup() catches up to the last read DMA index
+(q->tail == last), it re-reads the hardware DMA index register to check
+for frames completed while the loop ran. On PCIe MT7612E each re-read
+stalls the CPU for ~1.35 us.
+
+Add bool tx_no_reread to struct mt76_dev so dma.c stays driver-neutral
+(drivers that never set it, such as mt7603, keep the re-read), and add
+bit 1 (MT76X02_TX_OPT_NO_REREAD, 2) to the tx_opt parameter of
+mt76x02_lib, on by default. mt76x02 writes dev->mt76.tx_no_reread from
+bit 1 at device start and at the start of every TX NAPI poll, so runtime
+changes take effect immediately.
+
+Skipping the catch-up re-read only defers reclaiming frames that
+completed during cleanup; subsequent completions trigger a completion
+interrupt and are reclaimed on the next TX NAPI poll; flush calls never
+re-read, as before.
+
+Paired with skipping idle queues on MT7612E, catch-up re-reads dropped to
+zero, router-to-client UDP throughput rose +6.5% (23.1 vs 21.7 Mbit/s),
+and 90 Mbit/s TCP download gained +1.7 percentage points CPU idle (-1.3%
+CPU per Mbit/s). In a 24.58-hour site run with all four tx_opt bits
+active and an active-traffic channel-switch test (52->36->52: 4 switches
+with the bits on and 4 without, same result in both), TX status timeouts
+were 0.082% vs 0.093% without the patches, with zero TX hangs, zero
+resets, and all 8 switches finishing in 1.83-2.02 s.
+
+Writing 0 to the mt76x02_lib module parameter tx_opt restores the stock
+behaviour.
+---
+ dma.c          | 2 +-
+ mt76.h         | 1 +
+ mt76x02.h      | 4 +++-
+ mt76x02_mmio.c | 7 ++++++-
+ 4 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/dma.c b/dma.c
+index a67880a9..e804ae3b 100644
+--- a/dma.c
++++ b/dma.c
+@@ -444,7 +444,7 @@ mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
+ 				mt76_put_txwi(dev, entry.txwi);
+ 		}
+ 
+-		if (!flush && q->tail == last)
++		if (!flush && !READ_ONCE(dev->tx_no_reread) && q->tail == last)
+ 			last = mt76_dma_read_dma_idx(q, -1);
+ 	}
+ 	spin_unlock_bh(&q->cleanup_lock);
+diff --git a/mt76.h b/mt76.h
+index 4788af1b..51c980e3 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -1049,6 +1049,7 @@ struct mt76_dev {
+ 	};
+ 
+ 	atomic_t bus_hung;
++	bool tx_no_reread;
+ };
+ 
+ /* per-phy stats.  */
+diff --git a/mt76x02.h b/mt76x02.h
+index dac2869a..5e69f8d9 100644
+--- a/mt76x02.h
++++ b/mt76x02.h
+@@ -150,7 +150,9 @@ struct mt76x02_dev {
+ };
+ 
+ #define MT76X02_TX_OPT_SKIP_IDLE		BIT(0)
+-#define MT76X02_TX_OPT_DEFAULT			MT76X02_TX_OPT_SKIP_IDLE
++#define MT76X02_TX_OPT_NO_REREAD		BIT(1)
++#define MT76X02_TX_OPT_DEFAULT			\
++	(MT76X02_TX_OPT_SKIP_IDLE | MT76X02_TX_OPT_NO_REREAD)
+ 
+ extern unsigned int tx_opt;
+ extern struct ieee80211_rate mt76x02_rates[12];
+diff --git a/mt76x02_mmio.c b/mt76x02_mmio.c
+index 4ec78683..c85c8db8 100644
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -29,7 +29,7 @@ MODULE_PARM_DESC(delay_int,
+ unsigned int tx_opt = MT76X02_TX_OPT_DEFAULT;
+ module_param(tx_opt, uint, 0644);
+ MODULE_PARM_DESC(tx_opt,
+-		 "5 GHz TX path optimizations (bitmask): 1=skip idle queues; 0: off; default 0x1");
++		 "5 GHz TX path optimizations (bitmask): 1=skip idle queues, 2=skip catch-up index re-read; 0: off; default 0x3");
+ 
+ /* The interrupt of the main RX ring; the MCU ring keeps its own */
+ static u32 mt76x02_rx_main_int(struct mt76x02_dev *dev)
+@@ -203,6 +203,9 @@ static int mt76x02_poll_tx(struct napi_struct *napi, int budget)
+ 					       mt76.tx_napi);
+ 	int i;
+ 
++	WRITE_ONCE(dev->mt76.tx_no_reread,
++		   !!(READ_ONCE(tx_opt) & MT76X02_TX_OPT_NO_REREAD));
++
+ 	mt76x02_mac_poll_tx_status(dev, false);
+ 
+ 	mt76x02_clean_tx_queue(dev, dev->mt76.q_mcu[MT_MCUQ_WM]);
+@@ -401,6 +404,8 @@ void mt76x02_mac_start(struct mt76x02_dev *dev)
+ 		MT_MAC_SYS_CTRL_ENABLE_RX);
+ 
+ 	dev->delay_int = delay_int;
++	WRITE_ONCE(dev->mt76.tx_no_reread,
++		   !!(READ_ONCE(tx_opt) & MT76X02_TX_OPT_NO_REREAD));
+ 	mt76_wr(dev, MT_WPDMA_DELAY_INT_CFG, dev->delay_int);
+ 	mt76x02_irq_disable(dev, MT_INT_RX_DONE(MT_RXQ_MAIN) | MT_INT_RXDELAYINT |
+ 				 MT_INT_TX_DONE_ALL | MT_INT_TXDELAYINT);

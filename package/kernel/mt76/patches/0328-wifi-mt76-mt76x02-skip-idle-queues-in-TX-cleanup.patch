@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Thu, 12 Nov 2026 23:00:00 +0200
+Subject: [PATCH] wifi: mt76: mt76x02: skip idle queues in TX cleanup
+
+During 5 GHz TX NAPI polling on MT7612E, mt76x02_poll_tx() cleans the MCU
+ring and data queues MT_TXQ_PSD..0 both before and after
+napi_complete_done(). Most of those scans find an empty queue
+(q->queued == 0), yet each call executes a PCIe MMIO read of the DMA
+index register (~1.35 us CPU stall per read on MT7628AN).
+
+Add bit 0 (MT76X02_TX_OPT_SKIP_IDLE, 1) to the module parameter tx_opt
+of mt76x02_lib (on by default). When set, mt76x02_clean_tx_queue() skips
+mt76_queue_tx_cleanup() if READ_ONCE(q->queued) == 0. The parameter is
+read with READ_ONCE() on every call so writes take effect at run time
+without reloading the module.
+
+Waiters on dev->tx_wait check their pending condition before sleeping,
+and any queue that held frames still runs mt76_queue_tx_cleanup() and
+wakes waiters when it drains to empty. The pass-2 race around
+napi_complete_done() stays closed: if frames were queued before pass 2,
+q->queued is non-zero so pass 2 cleans them; later completions arrive
+after interrupts are re-enabled.
+
+Paired with skipping the catch-up DMA index re-read on MT7612E,
+router-to-client UDP throughput rose +6.5% (23.1 vs 21.7 Mbit/s) and
+90 Mbit/s TCP download gained +1.7 percentage points CPU idle (-1.3% CPU
+per Mbit/s). In a 24.58-hour site run with all four tx_opt bits active
+and an active-traffic channel-switch test (52->36->52: 4 switches with
+the bits on and 4 without, same result in both), TX status timeouts
+were 0.082% vs 0.093% without the patches, with zero TX hangs, zero
+resets, and all 8 switches finishing in 1.83-2.02 s.
+
+Writing 0 to the mt76x02_lib module parameter tx_opt restores the stock
+behaviour.
+---
+ mt76x02.h      |  4 ++++
+ mt76x02_mmio.c | 28 ++++++++++++++++++++++++----
+ 2 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/mt76x02.h b/mt76x02.h
+index 0d13dfa2..dac2869a 100644
+--- a/mt76x02.h
++++ b/mt76x02.h
+@@ -149,6 +149,10 @@ struct mt76x02_dev {
+ 	ktime_t ed_time;
+ };
+ 
++#define MT76X02_TX_OPT_SKIP_IDLE		BIT(0)
++#define MT76X02_TX_OPT_DEFAULT			MT76X02_TX_OPT_SKIP_IDLE
++
++extern unsigned int tx_opt;
+ extern struct ieee80211_rate mt76x02_rates[12];
+ 
+ int mt76x02_init_device(struct mt76x02_dev *dev);
+diff --git a/mt76x02_mmio.c b/mt76x02_mmio.c
+index 8b9d5f86..4ec78683 100644
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -23,6 +23,14 @@ MODULE_PARM_DESC(delay_int,
+ #define MT76X02_DELAY_INT_EN		BIT(15)
+ #define MT76X02_DELAY_INT_TX_SHIFT	16
+ 
++/* Bitmask of 5 GHz TX path optimizations (see MT76X02_TX_OPT_*). Read at
++ * run time; 0 restores stock behaviour.
++ */
++unsigned int tx_opt = MT76X02_TX_OPT_DEFAULT;
++module_param(tx_opt, uint, 0644);
++MODULE_PARM_DESC(tx_opt,
++		 "5 GHz TX path optimizations (bitmask): 1=skip idle queues; 0: off; default 0x1");
++
+ /* The interrupt of the main RX ring; the MCU ring keeps its own */
+ static u32 mt76x02_rx_main_int(struct mt76x02_dev *dev)
+ {
+@@ -177,6 +185,18 @@ static void mt76x02_tx_worker(struct mt76_worker *w)
+ 	mt76_txq_schedule_all(&dev->mphy);
+ }
+ 
++static void mt76x02_clean_tx_queue(struct mt76x02_dev *dev, struct mt76_queue *q)
++{
++	if (!q)
++		return;
++
++	if ((READ_ONCE(tx_opt) & MT76X02_TX_OPT_SKIP_IDLE) &&
++	    !READ_ONCE(q->queued))
++		return;
++
++	mt76_queue_tx_cleanup(dev, q, false);
++}
++
+ static int mt76x02_poll_tx(struct napi_struct *napi, int budget)
+ {
+ 	struct mt76x02_dev *dev = container_of(napi, struct mt76x02_dev,
+@@ -185,16 +205,16 @@ static int mt76x02_poll_tx(struct napi_struct *napi, int budget)
+ 
+ 	mt76x02_mac_poll_tx_status(dev, false);
+ 
+-	mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[MT_MCUQ_WM], false);
++	mt76x02_clean_tx_queue(dev, dev->mt76.q_mcu[MT_MCUQ_WM]);
+ 	for (i = MT_TXQ_PSD; i >= 0; i--)
+-		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], false);
++		mt76x02_clean_tx_queue(dev, dev->mphy.q_tx[i]);
+ 
+ 	if (napi_complete_done(napi, 0))
+ 		mt76x02_irq_enable(dev, mt76x02_tx_done_int(dev));
+ 
+-	mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[MT_MCUQ_WM], false);
++	mt76x02_clean_tx_queue(dev, dev->mt76.q_mcu[MT_MCUQ_WM]);
+ 	for (i = MT_TXQ_PSD; i >= 0; i--)
+-		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], false);
++		mt76x02_clean_tx_queue(dev, dev->mphy.q_tx[i]);
+ 
+ 	mt76_worker_schedule(&dev->mt76.tx_worker);
+ 

@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Thu, 12 Nov 2026 23:03:00 +0200
+Subject: [PATCH] wifi: mt76: mt76x02: skip TX status poll at TX NAPI start
+
+mt76x02_poll_tx() calls mt76x02_mac_poll_tx_status(dev, false) at the
+start of every TX NAPI poll cycle, issuing two PCIe MMIO reads
+(MT_TX_STAT_FIFO_EXT and MT_TX_STAT_FIFO, ~2.7 us) even though the
+hardware FIFO is almost always empty on NAPI entry.
+
+Add bit 3 (MT76X02_TX_OPT_SKIP_NAPI_STAT, 8) to tx_opt, bringing the
+default to 0xf. Read with READ_ONCE() at TX NAPI start, it skips that
+status FIFO poll.
+
+TX statuses then arrive solely via the MT_INT_TX_STAT hard interrupt
+into the 32-entry software txstatus_fifo and are drained by the TX
+worker (which polls both the hardware FIFO and txstatus_fifo after NAPI).
+Only one 5 GHz client was tested on site; multi-client burst saturation of
+the 32-entry FIFO remains untested, and the optimization can be disabled
+immediately at run time.
+
+Paired with skipping unrequested completion polls on MT7612E,
+router-to-client UDP throughput rose +4% (22.2 vs 21.3 Mbit/s), while
+90 Mbit/s TCP download remained within the measurement spread. Over a
+24.58-hour live-site run (three WPA3-SAE logins, six 20 Mbit/s UDP
+bursts, 176,041 status requests) with all four bits enabled, status
+timeouts were 0.082% against 0.093% without the patches with zero TX
+hangs and zero resets; in a subsequent channel-switch test (52->36->52:
+4 switches with all four bits on and 4 without), all 8 AP switches
+finished in 1.83-2.02 s with the same client behaviour.
+
+Writing 0 to the mt76x02_lib module parameter tx_opt restores the stock
+behaviour.
+---
+ mt76x02.h      | 3 ++-
+ mt76x02_mmio.c | 5 +++--
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/mt76x02.h b/mt76x02.h
+index 17486de7..d29b87ac 100644
+--- a/mt76x02.h
++++ b/mt76x02.h
+@@ -152,9 +152,10 @@ struct mt76x02_dev {
+ #define MT76X02_TX_OPT_SKIP_IDLE		BIT(0)
+ #define MT76X02_TX_OPT_NO_REREAD		BIT(1)
+ #define MT76X02_TX_OPT_SKIP_COMPLETE_STAT	BIT(2)
++#define MT76X02_TX_OPT_SKIP_NAPI_STAT		BIT(3)
+ #define MT76X02_TX_OPT_DEFAULT			\
+ 	(MT76X02_TX_OPT_SKIP_IDLE | MT76X02_TX_OPT_NO_REREAD | \
+-	 MT76X02_TX_OPT_SKIP_COMPLETE_STAT)
++	 MT76X02_TX_OPT_SKIP_COMPLETE_STAT | MT76X02_TX_OPT_SKIP_NAPI_STAT)
+ 
+ extern unsigned int tx_opt;
+ extern struct ieee80211_rate mt76x02_rates[12];
+diff --git a/mt76x02_mmio.c b/mt76x02_mmio.c
+index bb246b11..20d333f4 100644
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -29,7 +29,7 @@ MODULE_PARM_DESC(delay_int,
+ unsigned int tx_opt = MT76X02_TX_OPT_DEFAULT;
+ module_param(tx_opt, uint, 0644);
+ MODULE_PARM_DESC(tx_opt,
+-		 "5 GHz TX path optimizations (bitmask): 1=skip idle queues, 2=skip catch-up index re-read, 4=skip status poll on unrequested completions; 0: off; default 0x7");
++		 "5 GHz TX path optimizations (bitmask): 1=skip idle queues, 2=skip catch-up index re-read, 4=skip status poll on unrequested completions, 8=skip status poll at TX NAPI start; 0: off; default 0xf");
+ 
+ /* The interrupt of the main RX ring; the MCU ring keeps its own */
+ static u32 mt76x02_rx_main_int(struct mt76x02_dev *dev)
+@@ -206,7 +206,8 @@ static int mt76x02_poll_tx(struct napi_struct *napi, int budget)
+ 	WRITE_ONCE(dev->mt76.tx_no_reread,
+ 		   !!(READ_ONCE(tx_opt) & MT76X02_TX_OPT_NO_REREAD));
+ 
+-	mt76x02_mac_poll_tx_status(dev, false);
++	if (!(READ_ONCE(tx_opt) & MT76X02_TX_OPT_SKIP_NAPI_STAT))
++		mt76x02_mac_poll_tx_status(dev, false);
+ 
+ 	mt76x02_clean_tx_queue(dev, dev->mt76.q_mcu[MT_MCUQ_WM]);
+ 	for (i = MT_TXQ_PSD; i >= 0; i--)

@@ -1,0 +1,324 @@
+#!/usr/bin/ucode
+// Firmware update check of the Archer A5 v4 / C50 v4 build (luci-app-fwupdate).
+//
+//   fwupdate check     read release.json of the latest GitHub release and write
+//                      /tmp/fwupdate/status.json: is there a newer release, what changed,
+//                      and how it may be installed (auto, reset, manual)
+//   fwupdate download  download the sysupgrade image of that release to /tmp/fwupdate,
+//                      check its size and SHA256 and that sysupgrade accepts it
+//
+// Exit codes: 0 done, 2 no connection (worth trying again soon), 1 any other error.
+// Everything is kept in /tmp: a check never writes to the flash. /tmp is RAM, so a download
+// needs the image and a margin in MemAvailable, not just free space in /tmp.
+
+'use strict';
+
+import { readfile, writefile, rename, unlink, mkdir, popen, stat } from 'fs';
+import { cursor } from 'uci';
+
+const DIR = '/tmp/fwupdate';
+const STATUS = DIR + '/status.json';
+const DOWNLOAD = DIR + '/download.json';
+const IMAGE = DIR + '/firmware.bin';
+const PART = DIR + '/firmware.part';
+// the GitHub repository that publishes the releases, as build.sh recorded it; this one if not
+const DEFAULT_REPO = 'Dreyk007/openwrt-archer-a5v4-c50v4';
+const TAG_RE = /^v([0-9]+)\.([0-9]+)\.([0-9]+)-a5v4-r([0-9]+)$/;
+const METHODS = [ 'auto', 'reset', 'manual' ];
+// MemAvailable (KiB) that has to remain once the image is in /tmp: the image stays in RAM until
+// it is installed, and below about 6 MB the router reads its programs from the flash again and
+// again (RESEARCH.md, firmware updates)
+const SPARE_KB = 6144;
+// how long a download waits for the memory that the drop of the page cache freed (see below)
+const DRAIN_WAIT = 60;
+// The rpcd plugin (fwupdate.uc) takes a download for a stopped one once its dl.started is STALE
+// (900 s) old. Everything up to the end of curl counts from dl.started: the sync, the drop of the
+// page cache and its wait included. So curl gets what is left of this, which leaves about 60 s
+// for the SHA256 and the checks of the image; keep the sum below STALE.
+const DOWNLOAD_TIME = 840;
+// curl exit codes for a server the router could not reach: proxy and name resolution, connect,
+// timeout, a transfer cut off, HTTP/2 framing, TLS (also a clock that NTP has not set yet)
+const NO_CONNECTION = [ 5, 6, 7, 16, 18, 28, 35, 52, 55, 56, 60, 92 ];
+
+function q(s) {
+	return "'" + replace(s, "'", "'\\''") + "'";
+}
+
+function log(msg) {
+	system([ 'logger', '-t', 'fwupdate', msg ]);
+}
+
+// [ exit code, output ]
+function run(cmd) {
+	const p = popen(cmd + ' 2>&1');
+	if (!p)
+		return [ 127, '' ];
+	const out = p.read('all') || '';
+	return [ p.close(), out ];
+}
+
+function parse_json(s) {
+	try {
+		return json(s);
+	}
+	catch (e) {
+		return null;
+	}
+}
+
+function read_json(file) {
+	const s = readfile(file);
+	return (s == null) ? null : parse_json(s);
+}
+
+function write_json(file, data) {
+	writefile(file + '.tmp', sprintf('%J', data));
+	rename(file + '.tmp', file);
+}
+
+// The message of the last failed fetch, for the log
+let fetch_detail = '';
+
+// null on success, otherwise 'network', 'http <code>', 'space' (/tmp is full) or 'curl <exit
+// code>'. A URL of GitHub (https) may only redirect to https.
+function fetch(url, file, limits) {
+	const proto = (index(url, 'https://') == 0) ? '=https' : '=http,https';
+	const r = run(sprintf("curl -sS -f -L --max-redirs 5 --proto %s --proto-redir %s %s -w 'fwupdate-http=%%{http_code}\\n' -o %s %s",
+		proto, proto, limits, q(file), q(url)));
+	if (r[0] == 0)
+		return null;
+	unlink(file);
+	fetch_detail = trim(join(' ', filter(split(r[1], '\n'), (l) => index(l, 'fwupdate-http=') != 0)));
+	if (r[0] == 22) {
+		const m = match(r[1], /fwupdate-http=([0-9]+)/);
+		return (m && m[1] != '000') ? 'http ' + m[1] : 'http';
+	}
+	if (r[0] in NO_CONNECTION)
+		return 'network';
+	if (r[0] == 23)
+		return 'space';
+	return 'curl ' + r[0];
+}
+
+function installed() {
+	const s = readfile('/etc/a5v4_release') || '';
+	const get = (k) => {
+		const m = match(s, regexp('(^|\n)' + k + "='([^']*)'"));
+		return m ? m[2] : '';
+	};
+	return { release: get('RELEASE'), repo: get('REPO'), commit: get('COMMIT') };
+}
+
+function github(inst) {
+	return 'https://github.com/' + (match(inst.repo, /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/) ? inst.repo : DEFAULT_REPO);
+}
+
+function tag_key(tag) {
+	const m = (type(tag) == 'string') ? match(tag, TAG_RE) : null;
+	return m ? map(slice(m, 1), (x) => +x) : null;
+}
+
+// a is a later release than b
+function later(a, b) {
+	for (let i = 0; i < 4; i++)
+		if (a[i] != b[i])
+			return a[i] > b[i];
+	return false;
+}
+
+function method(r) {
+	if (r.upgrade == null)
+		return 'auto';
+	// an upgrade method this version does not know: never install it with the button
+	return (r.upgrade in METHODS) ? r.upgrade : 'manual';
+}
+
+function valid_release(rel, prefix) {
+	if (type(rel) != 'object' || !tag_key(rel.tag) || type(rel.releases) != 'array')
+		return false;
+	const img = rel.sysupgrade;
+	return type(img) == 'object' &&
+		type(img.url) == 'string' && index(img.url, prefix) == 0 &&
+		type(img.sha256) == 'string' && match(img.sha256, /^[0-9a-f]{64}$/) &&
+		type(img.size) == 'int' && img.size > 0;
+}
+
+function check() {
+	const custom = cursor().get('fwupdate', 'settings', 'url');
+	const st = { checked: time(), installed: installed() };
+	const repo = github(st.installed);
+	// a test server set in the hidden option url may also serve the image
+	const prefix = custom ? (match(custom, /^https?:\/\/[^\/]+\//) || [ '-' ])[0] : repo + '/releases/download/';
+	const old = read_json(STATUS) || {};
+
+	mkdir(DIR);
+	const err = fetch(custom || repo + '/releases/latest/download/release.json', DIR + '/release.new',
+		'--connect-timeout 20 --max-time 60');
+	const rel = err ? null : read_json(DIR + '/release.new');
+	unlink(DIR + '/release.new');
+
+	if (err || !valid_release(rel, prefix)) {
+		// keep what the last successful check found
+		for (let k in [ 'latest', 'local', 'update', 'method', 'releases', 'success' ])
+			if (k in old)
+				st[k] = old[k];
+		st.error = err || 'invalid';
+		write_json(STATUS, st);
+		log('check failed: ' + st.error + (err ? ' (' + fetch_detail + ')' : ''));
+		return (err == 'network') ? 2 : 1;
+	}
+
+	const ikey = tag_key(st.installed.release);
+	const lkey = tag_key(rel.tag);
+
+	// the releases a router on this version has not got yet, newest first; a local build
+	// does not know its place, so it only looks at the latest release
+	const pending = filter(rel.releases, (r) => {
+		const k = (type(r) == 'object') ? tag_key(r.tag) : null;
+		return k && (ikey ? later(k, ikey) && !later(k, lkey) : r.tag == rel.tag);
+	});
+
+	let worst = 0;
+	for (let r in pending)
+		if (index(METHODS, method(r)) > worst)
+			worst = index(METHODS, method(r));
+
+	st.error = null;
+	st.success = st.checked;
+	st.local = !ikey;
+	st.update = ikey ? later(lkey, ikey) : false;
+	st.method = METHODS[worst];
+	st.latest = {
+		tag: rel.tag, version: rel.version, number: rel.number, date: rel.date, url: rel.url,
+		sysupgrade: rel.sysupgrade
+	};
+	st.releases = map(pending, (r) => ({
+		tag: r.tag, date: r.date, url: r.url, upgrade: method(r), note: r.note, note_url: r.note_url,
+		changes: filter(r.changes || [], (c) => type(c) == 'object' && type(c.subject) == 'string')
+	}));
+
+	// an image downloaded for another release, or another image of it, is of no use any more
+	const dl = read_json(DOWNLOAD);
+	if (dl && (dl.tag != rel.tag || (dl.sha256 && dl.sha256 != rel.sysupgrade.sha256))) {
+		unlink(IMAGE);
+		unlink(PART);
+		unlink(DOWNLOAD);
+	}
+
+	write_json(STATUS, st);
+	log(st.update ? 'new release: ' + rel.tag : 'latest release: ' + rel.tag);
+	return 0;
+}
+
+// a value of /proc/meminfo in KiB
+function meminfo_kb(key) {
+	const m = match(readfile('/proc/meminfo') || '', regexp('(^|\n)' + key + ':[ \t]*([0-9]+) kB'));
+	return m ? +m[2] : 0;
+}
+
+function file_cache_kb() {
+	return meminfo_kb('Active\\(file\\)') + meminfo_kb('Inactive\\(file\\)');
+}
+
+// MemAvailable leaves out up to half of the file cache (up to the low watermark, about 10 MB
+// with min_free_kbytes 8192), although clean cache is freed as soon as the download needs the
+// memory: with much cached, the check would refuse an image that fits. So the clean page cache
+// is dropped first, as sysupgrade does before it writes the flash. 1 drops the page cache only:
+// the reclaimable slab (dentries, inodes) is small here, and every path lookup would read it in
+// again. The freed pages go to the kernel's per-CPU lists first, which MemAvailable does not
+// count, and reach it over about a minute (on the router, half of 6 MB in 20 s); allocations take
+// them at once, so only the count lags. False if the kernel refused the drop.
+function drop_page_cache() {
+	system('sync');
+	return writefile('/proc/sys/vm/drop_caches', '1') != null;
+}
+
+function download() {
+	const st = read_json(STATUS);
+	const dl = { state: 'error', started: time() };
+	const fail = (error, detail) => {
+		dl.error = error;
+		if (detail)
+			dl.detail = detail;
+		unlink(PART);
+		write_json(DOWNLOAD, dl);
+		log('download failed: ' + error + (detail ? ' (' + detail + ')' : ''));
+		return (error == 'network') ? 2 : 1;
+	};
+
+	mkdir(DIR);
+	if (!st || !st.latest)
+		return fail('no_release');
+	if (st.method == 'manual')
+		return fail('manual');
+
+	const img = st.latest.sysupgrade;
+	dl.tag = st.latest.tag;
+	dl.size = img.size;
+	unlink(IMAGE);
+
+	// the image takes its size of the RAM until it is installed or discarded
+	dl.mem = { needed: int(img.size / 1024) + SPARE_KB, before_drop: meminfo_kb('MemAvailable') };
+	dl.state = 'downloading';
+	write_json(DOWNLOAD, dl);
+	const cache = file_cache_kb();
+	if (drop_page_cache()) {
+		// wait for the freed memory while it can still make up what is missing
+		const freed = cache - file_cache_kb();
+		dl.mem.waited = 0;
+		while (meminfo_kb('MemAvailable') < dl.mem.needed && dl.mem.before_drop + freed >= dl.mem.needed &&
+		       dl.mem.waited < DRAIN_WAIT) {
+			sleep(2000);
+			dl.mem.waited += 2;
+		}
+	}
+	else
+		delete dl.mem.before_drop;
+	dl.mem.available = meminfo_kb('MemAvailable');
+	write_json(DOWNLOAD, dl);
+	dl.state = 'error';
+	if (dl.mem.available < dl.mem.needed)
+		return fail('space');
+
+	const left = DOWNLOAD_TIME - (time() - dl.started);
+	const err = fetch(img.url, PART, '--connect-timeout 20 --speed-limit 1024 --speed-time 60 --max-time ' +
+		(left > 10 ? left : 10));
+	if (err)
+		return fail((err == 'network' || err == 'space') ? err : 'http', err + ': ' + fetch_detail);
+
+	const s = stat(PART);
+	if (!s || s.size != img.size)
+		return fail('size');
+	const sum = match(run('sha256sum ' + q(PART))[1], /^[0-9a-f]{64}/);
+	if (!sum || sum[0] != img.sha256)
+		return fail('checksum');
+	rename(PART, IMAGE);
+	dl.mem.after = meminfo_kb('MemAvailable');
+
+	// the same checks as LuCI's System -> Backup / Flash Firmware
+	const v = parse_json(run('ubus call system validate_firmware_image ' + q(sprintf('%J', { path: IMAGE })))[1]) || {};
+	const t = run('sysupgrade -T ' + q(IMAGE));
+	dl.valid = (v.valid !== false) && t[0] == 0;
+	dl.allow_backup = (v.allow_backup !== false);
+	dl.sha256 = img.sha256;
+	if (!dl.valid) {
+		unlink(IMAGE);
+		return fail('invalid', trim(t[1]));
+	}
+
+	dl.state = 'ready';
+	write_json(DOWNLOAD, dl);
+	log(sprintf('downloaded and verified %s, MemAvailable %d kB before, %d kB after', dl.tag,
+		dl.mem.available, dl.mem.after));
+	return 0;
+}
+
+switch (ARGV[0]) {
+case 'check':
+	exit(check());
+case 'download':
+	exit(download());
+default:
+	warn('usage: fwupdate check|download\n');
+	exit(1);
+}

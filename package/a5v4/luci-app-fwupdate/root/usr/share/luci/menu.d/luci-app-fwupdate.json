@@ -1,0 +1,13 @@
+{
+	"admin/system/fwupdate": {
+		"title": "Archer A5 v4 / C50 v4 build updates",
+		"order": 71,
+		"action": {
+			"type": "view",
+			"path": "system/fwupdate"
+		},
+		"depends": {
+			"acl": [ "luci-app-fwupdate" ]
+		}
+	}
+}

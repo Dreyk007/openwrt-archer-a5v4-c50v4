@@ -1,0 +1,288 @@
+# Build the TP-Link Archer A5 v4 / C50 v4 firmware with build.sh in the build container of this
+# repository (docker/), the environment the builds are tested in, and publish it as a GitHub
+# release. Run it manually: Actions -> "Build Archer A5 v4 / C50 v4 firmware" -> Run workflow.
+name: Build Archer A5 v4 / C50 v4 firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (empty: v<OpenWrt version>-a5v4-r<next number>)'
+        required: false
+        default: ''
+      prerelease:
+        description: 'Publish as a pre-release (routers are not offered pre-releases)'
+        type: boolean
+        default: false
+      upgrade:
+        description: 'Update from LuCI (System -> Archer A5 v4 / C50 v4 build updates): auto; reset (only without keeping the settings); manual (no update button)'
+        type: choice
+        options:
+          - auto
+          - reset
+          - manual
+        default: auto
+      upgrade_note_en:
+        description: 'For reset/manual: why, in English (shown on the router)'
+        required: false
+        default: ''
+      upgrade_note_ru:
+        description: 'For reset/manual: why, in Russian (shown on the router)'
+        required: false
+        default: ''
+      upgrade_url:
+        description: 'For reset/manual: link to the instructions (optional)'
+        required: false
+        default: ''
+      runner:
+        description: 'Runner image (the build itself runs in the container of docker/Dockerfile)'
+        type: choice
+        options:
+          - ubuntu-24.04
+          - ubuntu-26.04
+        default: ubuntu-24.04
+
+permissions:
+  contents: write
+  # Signed build provenance: the OIDC token for the Sigstore certificate and storing the attestation
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: build-a5v4
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build and release
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 345
+    env:
+      TARGET_DIR: bin/targets/ramips/mt76x8
+      PREFIX: openwrt-ramips-mt76x8-tplink_archer-c50-v4
+
+    steps:
+      # The build tree takes about 12 GB, the container 2 GB, the downloads and the compiler
+      # cache 3 GB; the runner guarantees 14 GB.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache /usr/share/swift /usr/local/share/boost /usr/local/share/powershell \
+            /usr/local/share/chromium /usr/local/lib/node_modules /opt/microsoft /opt/az \
+            /opt/google /usr/lib/jvm
+          sudo docker image prune --all --force > /dev/null || true
+          sudo apt-get clean
+          df -h /
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          if [ "$avail" -lt 25 ]; then
+            echo "::error::Only ${avail} GB free, the build needs ~18 GB plus headroom"
+            exit 1
+          fi
+
+      # Full history: scripts/getver.sh derives the r<number> revision from it, and the
+      # tags are needed to number the release.
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Before the build: the image records its release for the update check on the router
+      - name: Choose release tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          UPGRADE: ${{ inputs.upgrade }}
+          NOTE_EN: ${{ inputs.upgrade_note_en }}
+          NOTE_RU: ${{ inputs.upgrade_note_ru }}
+        run: |
+          ver=$(grep -oP '(?<=,\$\(VERSION_NUMBER\),)[^)]*' include/version.mk)
+          if [ -n "$INPUT_TAG" ]; then
+            tag=$INPUT_TAG
+          else
+            last=$(git tag -l "v${ver}-a5v4-r*" | sed -n "s/^v${ver}-a5v4-r\([0-9][0-9]*\)$/\1/p" | sort -n | tail -1)
+            tag="v${ver}-a5v4-r$(( ${last:-0} + 1 ))"
+          fi
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-a5v4-r[0-9]+$ ]]; then
+            echo "::error::Tag $tag does not look like v<OpenWrt version>-a5v4-r<number>, which the update check on the router expects"
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
+            echo "::error::Tag $tag already exists"
+            exit 1
+          fi
+          if [ "$UPGRADE" != auto ] && { [ -z "${NOTE_EN// }" ] || [ -z "${NOTE_RU// }" ]; }; then
+            echo "::error::upgrade=$UPGRADE needs both notes (upgrade_note_en, upgrade_note_ru)"
+            exit 1
+          fi
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Restore source downloads
+        uses: actions/cache@v6
+        with:
+          path: dl
+          key: dl-${{ hashFiles('feeds.conf.default', 'include/kernel-*', 'target/linux/generic/kernel-*') }}-${{ github.run_id }}
+          restore-keys: dl-
+
+      # The compiler cache of the previous run: later builds only recompile what changed. The
+      # compilers come from the container, so the cache follows its Dockerfile.
+      - name: Restore compiler cache
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: ccache-${{ hashFiles('docker/Dockerfile') }}-${{ github.run_id }}
+          restore-keys: ccache-${{ hashFiles('docker/Dockerfile') }}-
+
+      # The profile of the releases (RESEARCH.md section 5); docker/run.sh passes A5V4_* on
+      - name: Build firmware
+        env:
+          A5V4_RELEASE: ${{ steps.tag.outputs.tag }}
+          A5V4_REPO: ${{ github.repository }}
+        run: docker/run.sh ./build.sh --ccache --profile o2 2>&1 | tee build.log
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 14
+
+      - name: Prepare release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ver: ${{ steps.tag.outputs.ver }}
+          tag: ${{ steps.tag.outputs.tag }}
+          UPGRADE: ${{ inputs.upgrade }}
+          NOTE_EN: ${{ inputs.upgrade_note_en }}
+          NOTE_RU: ${{ inputs.upgrade_note_ru }}
+          UPGRADE_URL: ${{ inputs.upgrade_url }}
+        run: |
+          # The files of a release: the image, the manifest, the size report and the build
+          # information. The sha256sums of the release covers these and release.json.
+          (cd "$TARGET_DIR" && sha256sum -c --quiet sha256sums)
+          image="$PREFIX-squashfs-sysupgrade.bin"
+          mkdir -p release
+          for f in "$image" "$PREFIX.manifest" size-report.txt config.buildinfo feeds.buildinfo version.buildinfo profiles.json; do
+            cp "$TARGET_DIR/$f" release/
+          done
+
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          prev=$(git describe --tags --abbrev=0 --match 'v*-a5v4-r*' HEAD 2> /dev/null || true)
+
+          # release.json for the update check on the router; it carries over the releases
+          # listed in the previous one
+          if [ -n "$prev" ]; then
+            gh release download "$prev" --repo "$GITHUB_REPOSITORY" --pattern release.json --output prev-release.json 2> /dev/null || true
+          fi
+          python3 .github/scripts/a5v4-release-json.py --tag "$tag" --commit "$GITHUB_SHA" --repo-url "$url" \
+            --image "release/$image" --prev-tag "$prev" --prev-json prev-release.json \
+            --upgrade "$UPGRADE" --note-en "$NOTE_EN" --note-ru "$NOTE_RU" --upgrade-url "$UPGRADE_URL" > release/release.json
+          (cd release && sha256sum -b -- * > ../sha256sums && mv ../sha256sums .)
+
+          # GitHub lists the assets below the notes, so the notes start with the direct link to
+          # the image and keep everything else in collapsed sections.
+          link() { echo "[\`$1\`]($url/releases/download/$tag/$1)"; }
+          size() { numfmt --to=iec-i --suffix=B --format='%.1f' "$(stat -c %s "release/$1")" | sed 's/[KMG]iB$/ &/'; }
+          {
+            echo "Optimized OpenWrt **${ver}** for **TP-Link Archer A5 v4 / Archer C50 v4** · [Installation guide]($url/blob/$GITHUB_SHA/README.md#installation) · [Инструкция на русском]($url/blob/$GITHUB_SHA/README.ru.md#установка)"
+            echo
+            echo "### Download"
+            echo
+            echo "| | File | Size |"
+            echo "|---|---|---|"
+            echo "| **The firmware:** installation from OpenWrt, updates (keep the settings), and the content of the recovery file \`tp_recovery.bin\` for an installation from the stock firmware | $(link "$image") | $(size "$image") |"
+            echo "| Checksums of all files | $(link sha256sums) | $(size sha256sums) |"
+            echo
+            echo "Never upload the firmware in the TP-Link web interface: from the stock firmware it goes through the TFTP recovery ([installation guide]($url/blob/$GITHUB_SHA/README.md#installation))."
+            echo
+            echo "<details><summary>Other files</summary>"
+            echo
+            echo "| File | Purpose |"
+            echo "|---|---|"
+            echo "| \`$PREFIX.manifest\` | Installed packages and their versions |"
+            echo "| \`size-report.txt\` | What the image takes of the flash and the kernel of the RAM |"
+            echo "| \`config.buildinfo\`, \`feeds.buildinfo\`, \`version.buildinfo\`, \`profiles.json\` | Build configuration, feed revisions, OpenWrt revision, image metadata |"
+            echo "| \`release.json\` | Release information for the firmware update check on the router (*System → Archer A5 v4 / C50 v4 build updates*) |"
+            echo
+            echo "</details>"
+            if [ -n "$prev" ]; then
+              echo
+              echo "<details><summary>Changes since $prev</summary>"
+              echo
+              git log --first-parent --format="* %s ([\`%h\`]($url/commit/%H))" "$prev..HEAD"
+              echo
+              echo "</details>"
+            fi
+            echo
+            echo "<details><summary>Build details</summary>"
+            echo
+            echo "* Commit [\`${GITHUB_SHA::10}\`]($url/commit/$GITHUB_SHA), built by [GitHub Actions]($url/actions/runs/$GITHUB_RUN_ID) in the container of \`docker/Dockerfile\`"
+            echo "* Revision: \`$(cat "$TARGET_DIR/version.buildinfo")\`, programs with the \`o2\` profile"
+            echo
+            echo '```'
+            cat release/size-report.txt
+            echo '```'
+            echo
+            echo "</details>"
+            echo
+            echo "<details><summary>SHA256 checksums</summary>"
+            echo
+            echo '```'
+            cat release/sha256sums
+            echo '```'
+            echo
+            echo "</details>"
+            echo
+            echo "<details><summary>Verifying the files</summary>"
+            echo
+            echo "Every file has a signed build provenance attestation that ties it to this workflow run and commit. With the [GitHub CLI](https://cli.github.com/):"
+            echo '```'
+            echo "gh attestation verify $image --repo $GITHUB_REPOSITORY"
+            echo '```'
+            echo "The release is immutable: its files and tag cannot be changed after publication. To check the release and a downloaded file against it:"
+            echo '```'
+            echo "gh release verify $tag --repo $GITHUB_REPOSITORY"
+            echo "gh release verify-asset $tag $image --repo $GITHUB_REPOSITORY"
+            echo '```'
+            echo
+            echo "</details>"
+          } > release-notes.md
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "title=Optimized OpenWrt $ver for TP-Link Archer A5 v4 / C50 v4 ($tag)" >> "$GITHUB_OUTPUT"
+
+      # Sigstore-signed SLSA provenance for every published file, recorded in the public
+      # transparency log: gh attestation verify <file> --repo <owner>/<repo>
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: release/*
+
+      # gh uploads the files to a draft and publishes it afterwards, so this also works
+      # with immutable releases (Settings -> General -> Releases -> Enable release immutability).
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          TITLE: ${{ steps.release.outputs.title }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          flags=()
+          [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+          gh release create "$TAG" release/* --target "$GITHUB_SHA" \
+            --title "$TITLE" --notes-file release-notes.md "${flags[@]}"
+          immutable=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .immutable)
+          if [ "$immutable" != "true" ]; then
+            echo "::warning::Release $TAG is not immutable, although its notes say so: enable Settings -> General -> Releases -> Enable release immutability"
+          fi
+
+      - name: Disk usage
+        if: always()
+        run: df -h /

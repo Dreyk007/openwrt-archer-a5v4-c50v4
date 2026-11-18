@@ -6,9 +6,19 @@
 # settings. These defaults are applied only once per configuration: a marker is stored in
 # /etc/config/a5v4, which sysupgrade keeps together with the rest of /etc/config, so that changes
 # of the user survive firmware upgrades. Defaults added later have markers of their own, so that
-# configurations made with an earlier version of the build get them too.
+# configurations made with an earlier version of the build get them too. Only the release name below
+# is set on every flash.
 #
 # Wi-Fi radio defaults are set by /etc/uci-defaults/77_wireless.
+
+# On every flash, as in the AX3200 build: the release of this build after the OpenWrt version, e.g.
+# "OpenWrt 25.12.6 r33311-981c978eff a5v4-r1" in Status -> Overview -> Firmware Version
+# (OPENWRT_RELEASE, which "ubus call system board" reports as the description). The release comes
+# from /etc/a5v4_release (build.sh); a local build has none and keeps the version as it is.
+. /etc/a5v4_release 2>/dev/null
+if [ -n "${RELEASE:-}" ] && ! grep -q "^OPENWRT_RELEASE=.* ${RELEASE#v*-}\"$" /usr/lib/os-release; then
+	sed -i "s/^OPENWRT_RELEASE=\"\(.*\)\"$/OPENWRT_RELEASE=\"\1 ${RELEASE#v*-}\"/" /usr/lib/os-release
+fi
 
 # Encrypted DNS (DoH), as in the AX3200 build: https-dns-proxy points dnsmasq at its local
 # instances (Cloudflare, Google) and only at them. LAN clients keep their own DNS settings:

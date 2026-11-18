@@ -30,6 +30,10 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 fi
 
 ARGS=(--rm --init -v "$REPO:/work" -w /work -e HOST_UID="$UID_HOST" -e HOST_GID="$GID_HOST")
+# The release information of the release workflow (build.sh writes it into the image)
+for v in A5V4_RELEASE A5V4_REPO; do
+    [ -n "${!v:-}" ] && ARGS+=(-e "$v")
+done
 [ -t 0 ] && [ -t 1 ] && ARGS+=(-it)
 if [ "$BENCH" = 1 ]; then
     # Network namespaces (unshare/nsenter) and tap devices for the LAN and WAN sides of the

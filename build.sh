@@ -54,6 +54,10 @@ usage() {
     echo "                        tcpdump and strace as packages for /tmp; without AmneziaWG"
     echo "  -j<N>                 Number of parallel compilation jobs (default: $(nproc))"
     echo "  -h, --help            Show this help message"
+    echo ""
+    echo "Environment (set by the release workflow): A5V4_RELEASE, the release tag recorded in"
+    echo "/etc/a5v4_release for the update check (empty for a local build); A5V4_REPO, the GitHub"
+    echo "repository of the releases (default: from the origin remote)."
 }
 
 # Parse optional arguments
@@ -365,6 +369,19 @@ make download -j"$JOBS"
 success "Source downloads complete."
 
 # 5. Compile firmware
+# The release of this image and the GitHub repository that publishes it, for the firmware update
+# check (luci-app-fwupdate): the GitHub workflow passes both (A5V4_RELEASE, A5V4_REPO); a local
+# build has no release and takes the repository from the origin remote, unless that is OpenWrt's
+# own (the update check then falls back to the repository of this build). The file is ignored by
+# git, so it does not count as an uncommitted change below.
+COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+git diff --quiet HEAD 2>/dev/null || COMMIT="$COMMIT-dirty"
+REPO=${A5V4_REPO:-$(git remote get-url origin 2>/dev/null | sed -nE 's#^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+)$#\2#p' | sed 's/\.git$//' || true)}
+[[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && [ "$REPO" != openwrt/openwrt ] || REPO=""
+mkdir -p files/etc
+printf "RELEASE='%s'\nREPO='%s'\nCOMMIT='%s'\n" "${A5V4_RELEASE:-}" "$REPO" "$COMMIT" > files/etc/a5v4_release
+info "Release: ${A5V4_RELEASE:-none (local build)}, repository ${REPO:-unknown}, commit $COMMIT"
+
 # Timestamp of the files in the image: the date of this fork's last commit. Otherwise the
 # release tag's version.date gives every build of a release the same one, and with it the
 # same ?v= that LuCI appends to its scripts and styles (the mtime of /lib/apk/db/installed),

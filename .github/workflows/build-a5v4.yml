@@ -38,9 +38,9 @@ on:
         description: 'Runner image (the build itself runs in the container of docker/Dockerfile)'
         type: choice
         options:
-          - ubuntu-24.04
           - ubuntu-26.04
-        default: ubuntu-24.04
+          - ubuntu-24.04
+        default: ubuntu-26.04
 
 permissions:
   contents: write

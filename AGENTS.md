@@ -120,10 +120,10 @@ core, no hardware NAT and no package manager in the image.
 
 ## LuCI and ucode
 
-The build has no own LuCI app yet. If it gets one, follow the layout of `luci-app-tuning` in
-openwrt-ax3200: a JS view, an rpcd ucode plugin in `root/usr/share/rpcd/ucode/<name>.uc` returning
-`{ 'luci.<name>': methods }`, `menu.d`, `acl.d`, `po/templates/*.pot` and `po/ru/*.po` (the image
-carries LuCI in Russian and English).
+The build's own LuCI app, `luci-app-fwupdate`, follows the layout of `luci-app-tuning` in
+openwrt-ax3200, and so should any other: a JS view, an rpcd ucode plugin in
+`root/usr/share/rpcd/ucode/<name>.uc` returning `{ 'luci.<name>': methods }`, `menu.d`, `acl.d`,
+`po/templates/*.pot` and `po/ru/*.po` (the image carries LuCI in Russian and English).
 
 - rpc calls time out: run anything that touches the network in the background
   (`(cmd) </dev/null >/dev/null 2>&1 &`) and let the page poll a status file. An rpcd plugin waits

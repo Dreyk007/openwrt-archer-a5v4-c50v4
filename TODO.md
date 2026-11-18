@@ -51,6 +51,10 @@ The plan decided on 2026-11-01. In this order; every step records its size cost
   `tx_opt=15` by default on `mt76x02_lib`, decided on 2026-11-11 after site A/B, 24 h run, and CSA
   checks, [RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router)); QEMU bench checks
   `tx_opt=15`.
+- Firmware updates from LuCI (`luci-app-fwupdate`, decided on 2026-11-17,
+  [RESEARCH.md section 17](RESEARCH.md#17-firmware-updates-from-luci)): the check of the GitHub
+  releases, the notice on the Overview page and the update with one button, with the release
+  information that `build.sh` writes and the release workflow publishes.
 
 1. **The router.** A full dump of all partitions before the first flash (`radio` and `rom` are
     unique to the unit), then `sysupgrade` (`-f` with a configuration tested in QEMU keeps the
@@ -64,10 +68,16 @@ The plan decided on 2026-11-01. In this order; every step records its size cost
         ([On the router](#on-the-router));
       - check the WAN MAC override that the README describes ([On the router](#on-the-router));
       - check the numbers and the LuCI paths against the released image.
-    - `.github/workflows/build-a5v4.yml` after `build-ax3200.yml` (no `release.json` and
-      fwupdate): the build in the container, `sha256sums`, attestation, tag `v25.12.6-a5v4-r1`.
-    - Before the push, disable the OpenWrt CI workflows that came with the tree; make
-      `a5v4-25.12` the default branch on GitHub (or fast-forward `main` to it).
+    - The release workflow is written (`.github/workflows/build-a5v4.yml`, 2026-11-17): the build
+      in the container, `sha256sums`, `release.json` for the update check, attestation
+      ([BUILDING.md](BUILDING.md#github-actions)). The owner's steps on GitHub are left (the
+      repository is public, and `a5v4-25.12` is its default branch already):
+      - push `a5v4-25.12`;
+      - enable Actions (off in the repository now);
+      - disable the OpenWrt CI workflows that came with the tree (`kernel.yml`, `packages.yml`,
+        `toolchain.yml`, `github-release.yml`, …), before anything triggers them;
+      - run the workflow for the tag `v25.12.6-a5v4-r1` (the default; release immutability on in
+        the repository settings).
     - A draft of the post for the 4pda thread (BBCode, in Russian).
 
 ## Checks and measurements
@@ -116,6 +126,9 @@ sources*).
   access point and client (also after `wifi down; wifi up`) and on `wg0`, threaded NAPI on `eth0`
   with its `napi/eth0-*` thread, both again after a reboot, and a device section with `gro '1'`
   turns GRO on *(bench)*.
+- **Firmware updates from LuCI:** the checker at idle; with a test server, the check, the notice of
+  the Overview page, the download (size, SHA256, the memory check) and no connection *(bench)*. A
+  malta image cannot be validated (`sysupgrade -T`): the router does that.
 - **First boot:** `/etc/uci-defaults` is empty afterwards, the defaults are set *(bench)*; they apply once
   (marker; test with a sysupgrade that keeps settings); without
   `urngd` the time to `crng init done` and to the dropbear host keys stays short.
@@ -126,6 +139,11 @@ sources*).
   [UPGRADING.md appendix C](UPGRADING.md#appendix-c-on-device-verification), both radios, all
   ports.
 - **Calibration:** `dmesg` shows no fallback to default EEPROM data for either radio.
+- **Firmware updates from LuCI** ([RESEARCH.md section 17](RESEARCH.md#17-firmware-updates-from-luci)):
+  done on 2026-11-17: an update by the router itself from a test server (the image validated, the
+  settings kept) and the cost of the notice with `tests/router/luci-bench.sh`. Left: after the
+  first release, a router on a test build (`v25.12.5-a5v4-r*`) is offered it; the buttons of the
+  page and the notice clicked in a browser (the test drove the page's calls over `/ubus`).
 - **RAM:** `MemAvailable` 5 minutes after boot and after an hour with clients.
 - **Kernel hardening:** a build without `SLAB_FREELIST_HARDENED` and the kernel stack protector
   against the normal one. The threat model is attacks from the WAN and from Wi-Fi clients that
@@ -298,7 +316,8 @@ What can go when the flash runs short, measured against the packages step
 then.
 
 - **libcurl without TLS** (`LIBCURL_NOSSL`, 2026-11-02 kept with TLS): travelmate keeps its captive
-  portal check over HTTP, but cannot log in to captive portals over HTTPS. Alone −18 KiB of
+  portal check over HTTP, but cannot log in to captive portals over HTTPS. It would also end DoH
+  and, since 2026-11-17, the firmware updates from LuCI, which need HTTPS. Alone −18 KiB of
   `root.squashfs`, since `wpad-basic-mbedtls` keeps `mbedtls`; together with `wpad-basic` (no
   WPA3) −265 KiB (248 + 17, measured on 2026-11-01 and 2026-11-02).
 - **PIE of the network-facing daemons off** (`PKG_ASLR_PIE_NONE`, 2026-11-02 kept on): −104 KiB of
@@ -426,9 +445,6 @@ Postponed by the owner on 2026-11-07, with PPPoE on the router (the bench covers
   10.24 ms), false detections over a day, and the clients after a switch (the test phone does not
   follow a CSA: dropped for missing ACKs 7–8 s after each switch, back after 17–138 s).
 - **LTO.** −5 KiB without MIPS16, breaks shared libraries with it. Not worth it.
-- **Firmware updates from LuCI** as in openwrt-ax3200. They need an HTTPS client, certificates
-  and `mbedtls`, which this build leaves out ([RESEARCH.md section 2](RESEARCH.md#2-size-of-the-programs)).
-  Not planned.
 - **SQM.** Not required. If a slow link with bufferbloat needs it, measure CAKE with software flow
   offloading at 50–100 Mbit/s first.
 - **zram.** The first build has no swap, like the official image: `KERNEL_SWAP` is off for

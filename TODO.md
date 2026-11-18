@@ -56,24 +56,14 @@ The plan decided on 2026-11-01. In this order; every step records its size cost
     unique to the unit), then `sysupgrade` (`-f` with a configuration tested in QEMU keeps the
     remote access), then the checks below.
 2. **Release.**
-    - Documentation: `README.md` and `README.ru.md` for users, now placeholders: installation and
-      backup ([RESEARCH.md section 1](RESEARCH.md#1-hardware-flash-layout-and-installation)), the
-      warnings (default Wi-Fi password, country PA, A5 v6 / C50 v6 are other hardware: the label,
-      no WPS LED, [RESEARCH.md section 15](RESEARCH.md#15-the-4pda-thread); TFTP needs the
-      firewall of the computer off; 5 GHz
-      starts in WPA2/WPA3 mode, 2.4 GHz in WPA2: a device that cannot join 5 GHz gets WPA2 there
-      in LuCI; SSH only at the LAN address, also through WireGuard), what the
-      build changes and leaves out ([RESEARCH.md section 10](RESEARCH.md#10-what-the-image-leaves-out)),
-      flash and RAM, the packages, setting up WISP, WAN L2TP (supported in the image; set up in
-      LuCI under Network → Interfaces by adding an interface with protocol `L2TP`, server, user name
-      and password in the `wan` zone, alongside the DHCP WAN underlay), WireGuard and AmneziaWG
-      (remote access through a VPS, full tunnel); no IPTV over multicast (the ISP's own router or set-top box; a set-top
-      box on its own VLAN works with the switch settings); DoH: on by default, ISP pages that rely on its DNS do not open,
-      no name resolves while DoH is unreachable, and how to turn it off
-      ([RESEARCH.md section 14](RESEARCH.md#14-encrypted-dns-doh)); GRO off and threaded NAPI: what
-      they give, and how to turn them on or off (a device section with `gro '1'`,
-      `a5v4.network.threaded_napi`); `BUILDING.md`, `BUILDING.ru.md`; the measurements in RESEARCH.md; the
-      tables of UPGRADING.md.
+    - `README.md` and `README.ru.md` are written (2026-11-17). At the release:
+      - remove the note that the first release is being prepared (the download links work then);
+      - section A (2026-11-18) goes through the 4pda recovery file with OpenWrt 19.07, the way the
+        owner checked, and then this build as in section B; the recipe of an own file with this
+        build follows under a spoiler. Repeat both when there is physical access
+        ([On the router](#on-the-router));
+      - check the WAN MAC override that the README describes ([On the router](#on-the-router));
+      - check the numbers and the LuCI paths against the released image.
     - `.github/workflows/build-a5v4.yml` after `build-ax3200.yml` (no `release.json` and
       fwupdate): the build in the container, `sha256sums`, attestation, tag `v25.12.6-a5v4-r1`.
     - Before the push, disable the OpenWrt CI workflows that came with the tree; make
@@ -288,12 +278,18 @@ sources*).
 - **The WAN MAC address override in LuCI** (2026-11-06, [RESEARCH.md section 15](RESEARCH.md#15-the-4pda-thread)):
   on 4pda it did not take effect on OpenWrt 19.07 for some users. Set it in LuCI on `wan`, check the
   address on `eth0.2` and the DHCP request of the WAN (`tcpdump` of the debug image), after a reboot too.
-- **Installation from the stock firmware** (TFTP recovery, [RESEARCH.md section 1](RESEARCH.md#1-hardware-flash-layout-and-installation))
-  with this build's image, when there is physical access.
+- **Installation from the stock firmware** as section A of the README describes (the 4pda recovery file with
+  OpenWrt 19.07, then `sysupgrade -n` to this build; [RESEARCH.md section 1](RESEARCH.md#1-hardware-flash-layout-and-installation)),
+  and with an own `tp_recovery.bin` from the spoiler there, when there is physical access. Once the own file
+  works, remove the warning of the spoiler.
 
 ## Open decisions
 
-None at the moment (2026-11-06: IGMP snooping on `br-lan` went with IPTV).
+- **A ready `tp_recovery.bin` for the stock firmware** (2026-11-18). The README sends users to the 4pda file
+  with OpenWrt 19.07, a build of unknown origin, and then to `sysupgrade -n`. The alternative is an own
+  file with this build in every release: one step, no 4pda. It needs TP-Link's second bootloader, which
+  OpenWrt does not distribute; the release workflow would take it from TP-Link's firmware and check its
+  hash. Needs the owner's decision and a TFTP test with physical access.
 
 ## Space reserve
 

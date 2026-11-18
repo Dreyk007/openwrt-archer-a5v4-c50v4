@@ -2,14 +2,14 @@
 
 Guidance for AI coding agents (and people) working on this repository.
 
-**Read the documentation first:** `README.md` and `README.ru.md` (for users; a placeholder until the
-first release), `UPGRADING.md` (every file this fork adds or changes, and how it is ported to a new
+**Read the documentation first:** `README.md` and `README.ru.md` (for users), `UPGRADING.md` (every file this fork adds or changes, and how it is ported to a new
 OpenWrt release), `RESEARCH.md` (the measurements and source checks behind the defaults; each
 section ends with its decision, so do not propose a rejected option again without new data) and
 `TODO.md` (the plan of the first release, what is still to be checked and measured, open
-decisions, patches to drop once upstream has the fix, deferred candidates). `BUILDING.md` follows
-with the first release. OpenWrt's own `.github/llm-review-rules.md` applies to patches. This file
-only adds what those documents do not cover.
+decisions, patches to drop once upstream has the fix, deferred candidates). `BUILDING.md` and
+`BUILDING.ru.md` describe the build for people who build the firmware themselves. OpenWrt's own
+`.github/llm-review-rules.md` applies to patches. This file only adds what those documents do not
+cover.
 
 The build follows [openwrt-ax3200](https://github.com/Dreyk007/openwrt-ax3200), a sibling build for
 the Xiaomi AX3200: the same structure of the documentation and the same way of working. Its
@@ -139,8 +139,15 @@ carries LuCI in Russian and English).
 
 - Plain language for users. Implementation details (patch numbers, file paths, how something was
   fixed, internal tooling) belong in `UPGRADING.md` and `RESEARCH.md`, not in the README.
-- `README.md` and `README.ru.md` change together; so will `BUILDING.md` and `BUILDING.ru.md`,
-  which follow with the first release.
+- The README is impersonal and general: a client rather than the phone of a test, nothing about the
+  test site (its ISP, its devices). Each installation case leads with the one checked way, and its
+  steps carry what they need (getting the file onto the router); an unchecked alternative goes under
+  a spoiler (`<details>`) with its source.
+- `README.md` and `README.ru.md` change together, and so do `BUILDING.md` and `BUILDING.ru.md`. A
+  change of `build.sh`, the bench or the build files updates both BUILDING files.
+- `BUILDING.md` and `BUILDING.ru.md` hold only the steps of the one way that works: no alternatives,
+  options or explanations of why. Options are in `build.sh --help`; details belong in this file,
+  `UPGRADING.md` and `RESEARCH.md`.
 - The firmware is published on GitHub and in the 4pda thread of the Archer A5: users install it
   from the stock firmware, without a package manager afterwards. Spell out what the build leaves
   out and what each setup (WISP, WireGuard) needs; IPTV over multicast is not supported (`RESEARCH.md`

@@ -42,10 +42,11 @@ core, no hardware NAT and no package manager in the image.
 ## Building and testing
 
 - Builds run on a build PC in a Docker container (`docker/Dockerfile`, `debian:testing`):
-  `docker/run.sh ./build.sh --ccache` (`--profile o2` for the other flags of the programs; a change of
-  profile rebuilds every package), on an ext4 file system (not on an NTFS volume, which
-  breaks the OpenWrt build). `--seed reference.config` builds the official package set for size
-  comparisons. A full build takes long: run it in the background and check its log.
+  `docker/run.sh ./build.sh --ccache`, on an ext4 file system (not on an NTFS volume, which
+  breaks the OpenWrt build). The programs are always built with the flags of the releases (`-O2`
+  for the 24KEc, no MIPS16; `RESEARCH.md` section 5). `--seed reference.config` builds the official
+  package set with these flags, for size comparisons. A full build takes long: run it in the
+  background and check its log.
 - **QEMU first.** Every image is tested on the QEMU bench before it goes to the router:
   `docker/run.sh ./build.sh --qemu --ccache`, then `docker/run.sh --bench tests/qemu/bench.sh`
   (malta/le with the same `mipsel_24kc` programs, `-cpu 24KEc -m 64`; `--official` boots the

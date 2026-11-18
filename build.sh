@@ -32,7 +32,6 @@ CCACHE=0
 QEMU=0
 DEV=0
 SEED="a5v4.config"
-PROFILE="hybrid"
 JOBS="$(nproc)"
 
 # Size of the firmware partition of the Archer C50 v4 (IMAGE_SIZE in target/linux/ramips/image/mt76x8.mk)
@@ -43,10 +42,9 @@ usage() {
     echo ""
     echo "Options:"
     echo "  -i, --install-deps    Install required build dependencies via apt (not needed in the container)"
-    echo "      --seed <file>     Configuration seed (default: $SEED; reference.config is the official set)"
+    echo "      --seed <file>     Configuration seed (default: $SEED; reference.config is the official"
+    echo "                        package set, built with the flags of this build)"
     echo "      --qemu            Build the seed for the QEMU bench (malta/le) instead of the router"
-    echo "      --profile <name>  Compiler flags of the programs: hybrid (default; OpenWrt's -Os with"
-    echo "                        MIPS16, ucode without MIPS16) or o2 (-O2 for the 24KEc, no MIPS16)"
     echo "      --ccache          Keep a compiler cache in .ccache, so that later builds only recompile what changed"
     echo "      --dev             Debug image for diagnostics on the router, not for release: debugfs of the"
     echo "                        kernel, mac80211 and mt76, kernel symbols, SysRq, perf events, tracepoints,"
@@ -76,13 +74,6 @@ while [ "$#" -gt 0 ]; do
         --qemu)
             QEMU=1
             ;;
-        --profile)
-            PROFILE="${2:?--profile needs a name}"
-            shift
-            ;;
-        --profile=*)
-            PROFILE="${1#--profile=}"
-            ;;
         --ccache)
             CCACHE=1
             ;;
@@ -105,21 +96,9 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-# The compiler flags of the programs; the kernel has its own (-O2 from the seed). hybrid: OpenWrt's
-# -Os with MIPS16, ucode without MIPS16 (its Makefile); o2: -O2 for the 24KEc with its DSP ASE and
-# without MIPS16 (RESEARCH.md section 5).
-case "$PROFILE" in
-    hybrid)
-        PROFILE_FLAGS=""
-        ;;
-    o2)
-        PROFILE_FLAGS="-O2 -pipe -mno-branch-likely -march=24kec -mtune=24kec"
-        ;;
-    *)
-        error "Unknown profile: $PROFILE (hybrid or o2)"
-        exit 1
-        ;;
-esac
+# The compiler flags of the programs, without MIPS16: -O2 for the 24KEc with its DSP ASE (RESEARCH.md
+# section 5). The kernel has its own (-O2 from the seed).
+PROGRAM_OPTIMIZATION="-O2 -pipe -mno-branch-likely -march=24kec -mtune=24kec"
 
 if [ "$QEMU" = 1 ]; then
     TARGET_DIR="bin/targets/malta/le"
@@ -137,7 +116,7 @@ echo -e "${BOLD}================================================================
 echo -e "${BOLD} OpenWrt Firmware Build System — TP-Link Archer A5 v4 / C50 v4 ${NC}"
 echo -e "${BOLD} Target: ${TARGET_NAME}${NC}"
 echo -e "${BOLD} Seed:   ${SEED}${NC}"
-echo -e "${BOLD} Programs: profile ${PROFILE}${NC}"
+echo -e "${BOLD} Programs: ${PROGRAM_OPTIMIZATION}${NC}"
 if [ "$DEV" = 1 ]; then
     echo -e "${BOLD} Debug image (--dev): diagnostics, not for release${NC}"
 fi
@@ -255,13 +234,11 @@ if [ "$QEMU" = 1 ]; then
 else
     cp "$SEED" .config
 fi
-if [ -n "$PROFILE_FLAGS" ]; then
-    {
-        echo "CONFIG_TARGET_OPTIONS=y"
-        echo "CONFIG_TARGET_OPTIMIZATION=\"$PROFILE_FLAGS\""
-        echo "# CONFIG_USE_MIPS16 is not set"
-    } >> .config
-fi
+{
+    echo "CONFIG_TARGET_OPTIONS=y"
+    echo "CONFIG_TARGET_OPTIMIZATION=\"$PROGRAM_OPTIMIZATION\""
+    echo "# CONFIG_USE_MIPS16 is not set"
+} >> .config
 # The compiler cache is a build option and does not change the firmware; the seed leaves it off
 if [ "$CCACHE" = 1 ]; then
     echo "CONFIG_CCACHE=y" >> .config
@@ -337,8 +314,8 @@ PROGRAM_FLAGS="$(sed -n 's/^CONFIG_TARGET_OPTIMIZATION="\(.*\)"$/\1/p' .config)"
 if grep -q '^CONFIG_USE_MIPS16=y' .config; then
     PROGRAM_FLAGS="$PROGRAM_FLAGS, MIPS16"
 fi
-if [ -n "$PROFILE_FLAGS" ] && [ "$PROGRAM_FLAGS" != "$PROFILE_FLAGS" ]; then
-    error "Profile $PROFILE did not apply: the programs are built with $PROGRAM_FLAGS"
+if [ "$PROGRAM_FLAGS" != "$PROGRAM_OPTIMIZATION" ]; then
+    error "The compiler flags did not apply: the programs are built with $PROGRAM_FLAGS"
     exit 1
 fi
 success "Configuration applied successfully (programs: $PROGRAM_FLAGS)."
@@ -521,7 +498,7 @@ MODDIR="$(first "$ROOT"/lib/modules/*/)"
 {
     echo "Build: $(git log -1 --format='%h %s' 2>/dev/null)$(git diff --quiet HEAD 2>/dev/null || echo ' (uncommitted changes)')"
     echo "Seed: $SEED; target: $TARGET_NAME"
-    echo "Programs: profile $PROFILE ($PROGRAM_FLAGS)"
+    echo "Programs: $PROGRAM_FLAGS"
     if [ "$QEMU" = 0 ]; then
         SYSUPGRADE="$(first "$TARGET_DIR"/*tplink_archer-c50-v4-squashfs-sysupgrade.bin)"
         if [ -n "$SYSUPGRADE" ]; then

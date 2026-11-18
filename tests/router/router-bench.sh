@@ -1,13 +1,12 @@
 #!/bin/sh
-# Measurements on the router for the A/B of the build profiles (TODO.md): memory, idle CPU, the
-# speed of the programs (busybox, ucode, jsonfilter, ubus, uci, wg, dnsmasq) and the timeline of the
-# last boot. The forwarding path is the kernel's and the same in both profiles; tests/router/
-# luci-bench.sh measures LuCI.
+# Measurements on the router for an A/B of two images: memory, idle CPU, the speed of the programs
+# (busybox, ucode, jsonfilter, ubus, uci, wg, dnsmasq) and the timeline of the last boot. It served
+# the A/B of the compiler flags (RESEARCH.md section 5); tests/router/luci-bench.sh measures LuCI.
 #
 #   ssh root@192.168.1.1 sh -s < tests/router/router-bench.sh
 #
 # Each program test runs three times; the median counts. Times come from /proc/uptime (10 ms), so
-# the tests are sized to take seconds. Inputs are the same in both profiles.
+# the tests are sized to take seconds. Inputs are the same in both images.
 
 T=/tmp/router-bench
 rm -rf "$T"

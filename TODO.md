@@ -37,10 +37,9 @@ The plan decided on 2026-11-01. In this order; every step records its size cost
 - WPA3 (`wpad-basic-mbedtls`): 5 GHz WPA2/WPA3 mixed mode by default, 2.4 GHz WPA2; `drop_invalid`
   and SSH only on the LAN in the first-boot defaults (as in openwrt-ax3200). Seccomp stays off, PIE
   stays on (2026-11-02).
-- Two profiles of the programs, `build.sh --profile hybrid|o2` (2026-11-02, [RESEARCH.md section 5](RESEARCH.md#5-compiler-and-flags)):
-  `hybrid` (OpenWrt's `-Os` with MIPS16, ucode without MIPS16; the default of `build.sh`) and `o2`
-  (`-O2 -pipe -mno-branch-likely -march=24kec -mtune=24kec`, no MIPS16). Both pass the QEMU bench;
-  `o2` was chosen after the router test (2026-11-03): releases build with `--profile o2`. No LTO.
+- The programs with `-O2 -pipe -mno-branch-likely -march=24kec -mtune=24kec`, no MIPS16 ([RESEARCH.md section 5](RESEARCH.md#5-compiler-and-flags)):
+  chosen over OpenWrt's `-Os` with MIPS16 after the router test (2026-11-03), and since 2026-11-18
+  the only flags of `build.sh` (the `hybrid` profile and `--profile` are gone). No LTO.
 - The flowtable hotplug script of openwrt-ax3200 (`20-firewall-wifi`) is not needed: with software
   offloading the flowtable holds `br-lan`, not the Wi-Fi interfaces
   ([RESEARCH.md section 8](RESEARCH.md#8-routing-acceleration-and-iptv)).
@@ -137,14 +136,7 @@ sources*).
   [UPGRADING.md appendix C](UPGRADING.md#appendix-c-on-device-verification), both radios, all
   ports.
 - **Calibration:** `dmesg` shows no fallback to default EEPROM data for either radio.
-- **RAM:** `MemAvailable` 5 minutes after boot and after an hour with clients, for both profiles.
-- **Profiles `hybrid` / `o2`** (`hybrid` measured on 2026-11-03, [RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router);
-  the images of one commit, flashed in turn with the settings kept; `tests/router/router-bench.sh`):
-  `tests/router/luci-bench.sh` a few times each, interleaved (LuCI's HTML and ubus calls on the router
-  itself); the same pages in a browser; `MemAvailable` 5 minutes after boot and after an hour with
-  clients; the time of a WPA3 connection; the time from power on to SSH. The forwarding path is the
-  kernel's and the same in both. If `hybrid` loses on LuCI, try it with libubox, libuci, rpcd,
-  uhttpd and json-c without MIPS16 too: in `o2` these stay at the `-Os` of their CMakeLists.
+- **RAM:** `MemAvailable` 5 minutes after boot and after an hour with clients.
 - **Kernel hardening:** a build without `SLAB_FREELIST_HARDENED` and the kernel stack protector
   against the normal one. The threat model is attacks from the WAN and from Wi-Fi clients that
   are not authorised. Both reach kernel code (frame parsing in mac80211/mt76, the network stack,

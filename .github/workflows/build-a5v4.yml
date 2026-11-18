@@ -143,7 +143,7 @@ jobs:
         env:
           A5V4_RELEASE: ${{ steps.tag.outputs.tag }}
           A5V4_REPO: ${{ github.repository }}
-        run: docker/run.sh ./build.sh --ccache --profile o2 2>&1 | tee build.log
+        run: docker/run.sh ./build.sh --ccache 2>&1 | tee build.log
 
       - name: Upload build log
         if: failure()
@@ -224,7 +224,7 @@ jobs:
             echo "<details><summary>Build details</summary>"
             echo
             echo "* Commit [\`${GITHUB_SHA::10}\`]($url/commit/$GITHUB_SHA), built by [GitHub Actions]($url/actions/runs/$GITHUB_RUN_ID) in the container of \`docker/Dockerfile\`"
-            echo "* Revision: \`$(cat "$TARGET_DIR/version.buildinfo")\`, programs with the \`o2\` profile"
+            echo "* Revision: \`$(cat "$TARGET_DIR/version.buildinfo")\`, programs with \`-O2\` for the 24KEc, without MIPS16"
             echo
             echo '```'
             cat release/size-report.txt

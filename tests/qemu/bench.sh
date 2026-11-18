@@ -545,6 +545,164 @@ offload_run() { # $1 = name of the check
     info "iperf3 LAN -> internet ($2): $(grep -E 'sender$' "$W/iperf3-$2.log" | awk '{print $7, $8}') (TCG, not the router's speed)"
 }
 
+# --- Firmware updates (luci-app-fwupdate). At idle the checker sleeps and has downloaded nothing.
+# A test server on the internet host, set in the hidden option url, serves release.json, written
+# by the release script of the workflow, and an image: the first 3 MiB of the bench's own malta
+# image. The whole one (5.3 MB) needs 11.5 MB of MemAvailable with the margin, about what the bench
+# has at this point (11.3-11.6 MB in a run): the malta kernel leaves 4 MB less RAM than the router's.
+# The router runs as release r1 of a made-up series: r2 (marked reset) and r3 (auto) are newer.
+FWU_SRV="$W/fwu-srv"
+FWU_URL=http://198.18.0.1:8080
+FWU_TAG=v25.12.5-a5v4-r3
+FWU_IMG="$W/openwrt-malta-le-bench.bin"
+# Anchored: the shell that runs a command over SSH has the pattern in its own command line
+fwu_daemon() { r "pgrep -f '^/bin/sh /usr/libexec/fwupdate-daemon'"; }
+fwu_busy() { r "pgrep -f '^/usr/bin/ucode /usr/libexec/fwupdate [cd]'" | grep -q .; }
+fwu_idle() { ! fwu_busy; }
+# Private and resident memory and page tables of the checker and its child (asleep: sleep)
+fwu_daemon_mem() {
+    r 'd=$(pgrep -f "^/bin/sh /usr/libexec/fwupdate-daemon" | head -n 1)
+       for p in $d $(grep -l "^PPid:[[:space:]]*$d\$" /proc/[0-9]*/status 2>/dev/null | cut -d/ -f3); do
+           printf "%s %s/%s kB, page tables %s kB; " "$(cat /proc/$p/comm)" \
+               "$(sed -n "s/^RssAnon:[[:space:]]*\([0-9]*\).*/\1/p" /proc/$p/status)" \
+               "$(sed -n "s/^VmRSS:[[:space:]]*\([0-9]*\).*/\1/p" /proc/$p/status)" \
+               "$(sed -n "s/^VmPTE:[[:space:]]*\([0-9]*\).*/\1/p" /proc/$p/status)"
+       done'
+}
+t_fwu_idle() {
+    fwu_daemon | grep -q . || { echo "the checker does not run"; return 1; }
+    ! r 'ls /tmp/fwupdate/firmware.bin /tmp/fwupdate/firmware.part /tmp/fwupdate/download.json' 2>/dev/null
+}
+# git refuses a checkout of another owner (the bench runs as root)
+bench_git() { GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' "$@"; }
+# release.json of FWU_TAG with the last two commits as its changes, carrying over a made-up
+# release.json of r2 and r1
+fwu_release() {
+    local img
+    img="$FWU_SRV/releases/download/$FWU_TAG/$(basename "$FWU_IMG")"
+    mkdir -p "$(dirname "$img")"
+    [ -f "$FWU_IMG" ] || head -c 3145728 "$ROOTFS_GZ" > "$FWU_IMG"
+    cp "$FWU_IMG" "$img"
+    cat > "$FWU_SRV/prev-release.json" <<EOF
+{"tag": "v25.12.5-a5v4-r2", "releases": [
+ {"tag": "v25.12.5-a5v4-r2", "date": "2026-11-02T00:00:00Z", "url": "$FWU_URL/r2", "upgrade": "reset",
+  "note": {"en": "Bench: the settings cannot be kept.", "ru": "Стенд: настройки не сохраняются."},
+  "changes": [{"commit": "0000000000", "subject": "bench: an earlier release"}]},
+ {"tag": "v25.12.5-a5v4-r1", "date": "2026-11-01T00:00:00Z", "url": "$FWU_URL/r1", "upgrade": "auto", "changes": []}]}
+EOF
+    bench_git python3 .github/scripts/a5v4-release-json.py --tag "$FWU_TAG" \
+        --commit "$(bench_git git rev-parse HEAD)" --repo-url "$FWU_URL" --image "$img" \
+        --prev-tag HEAD~2 --prev-json "$FWU_SRV/prev-release.json" > "$FWU_SRV/release.json"
+}
+fwu_serve() {
+    nsx wan python3 -m http.server 8080 --bind 198.18.0.1 --directory "$FWU_SRV" >> "$W/fwu-srv.log" 2>&1 &
+    echo $! > "$W/fwu-srv.pid"
+    fwu_up() { r "curl -fsS -o /dev/null $FWU_URL/release.json"; }
+    wait_for 20 fwu_up
+}
+fwu_stop() {
+    [ -f "$W/fwu-srv.pid" ] && kill "$(cat "$W/fwu-srv.pid")" 2>/dev/null
+    rm -f "$W/fwu-srv.pid"
+}
+# release.json changed on the server: check again, then download
+fwu_download() { r '/usr/libexec/fwupdate check >/dev/null 2>&1; /usr/libexec/fwupdate download; echo "rc=$?"; cat /tmp/fwupdate/download.json'; }
+fwu_meminfo() { r "grep -E '^(MemFree|MemAvailable|Cached|Shmem):' /proc/meminfo" | tr -s ' \n' ' '; }
+fwu_json() { # $1 = file on the router, $2 = a Python expression of s that must hold
+    r "cat $1" | python3 -c 'import json, sys
+s = json.load(sys.stdin)
+if not eval("(" + sys.argv[1] + ")"):
+    print(json.dumps(s)[:600])
+    sys.exit(1)' "$2"
+}
+# The status lists both newer releases with their changes, newest first, and the method of the
+# update is the strictest of them (reset)
+t_fwu_check() {
+    r "uci set fwupdate.settings.url='$FWU_URL/release.json'; uci commit fwupdate
+       /usr/libexec/fwupdate check" || return 1
+    fwu_json /tmp/fwupdate/status.json \
+        's["update"] is True and s["local"] is False and s["method"] == "reset" and s["error"] is None
+         and [x["tag"] for x in s["releases"]] == ["'"$FWU_TAG"'", "v25.12.5-a5v4-r2"]
+         and len(s["releases"][0]["changes"]) == 2 and s["releases"][0]["upgrade"] == "auto"
+         and s["releases"][1]["changes"][0]["subject"] == "bench: an earlier release"
+         and s["releases"][1]["note"]["ru"] and s["latest"]["sysupgrade"]["size"] > 1000000'
+}
+# What the Overview page asks on every refresh, as LuCI asks it (session, ACL)
+t_fwu_notice() {
+    local session
+    session="$(luci_session)"
+    nsx lan curl -s --max-time 60 http://192.168.1.1/ubus -d \
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"call\",\"params\":[\"$session\",\"luci.fwupdate\",\"notice\",{}]}" \
+        | grep -q "\"tag\": *\"$FWU_TAG\""
+}
+# Size and SHA256 match; then sysupgrade of malta refuses the image (no platform_check_image)
+t_fwu_download_malta() {
+    fwu_download | grep -q '^rc=1' || return 1
+    fwu_json /tmp/fwupdate/download.json 's["error"] == "invalid" and "not implemented" in s.get("detail", "")' &&
+        ! r 'ls /tmp/fwupdate/firmware.bin /tmp/fwupdate/firmware.part' 2>/dev/null
+}
+# With a platform check that accepts it, the image is ready to install; discard frees it
+t_fwu_download_ready() {
+    local sum
+    r 'echo "platform_check_image() { return 0; }" > /lib/upgrade/zz-bench.sh' || return 1
+    fwu_meminfo > "$W/fwu-mem.txt"
+    fwu_download | grep -q '^rc=0' || { r 'rm -f /lib/upgrade/zz-bench.sh'; return 1; }
+    r 'rm -f /lib/upgrade/zz-bench.sh'
+    sum="$(sha256sum < "$FWU_IMG" | cut -d' ' -f1)"
+    fwu_json /tmp/fwupdate/download.json \
+        's["state"] == "ready" and s["valid"] is True and s["allow_backup"] is True and s["sha256"] == "'"$sum"'"
+         and "before_drop" in s["mem"] and s["mem"]["available"] >= s["mem"]["needed"]' || return 1
+    [ "$(r 'sha256sum /tmp/fwupdate/firmware.bin' | cut -d' ' -f1)" = "$sum" ] || return 1
+    echo "; with the image in /tmp: $(fwu_meminfo)" >> "$W/fwu-mem.txt"
+    r 'ubus call luci.fwupdate discard' | grep -q '"ok"' && ! r 'ls /tmp/fwupdate/firmware.bin' 2>/dev/null
+}
+t_fwu_bad_checksum() {
+    fwu_release
+    sed -i 's/"sha256": "[0-9a-f]*"/"sha256": "'"$(printf '%064d' 0)"'"/' "$FWU_SRV/release.json"
+    fwu_download | grep -q '^rc=1' || return 1
+    fwu_json /tmp/fwupdate/download.json 's["error"] == "checksum"' &&
+        ! r 'ls /tmp/fwupdate/firmware.bin /tmp/fwupdate/firmware.part' 2>/dev/null
+}
+# An image larger than MemAvailable minus the margin is not downloaded at all, also after the drop
+# of the page cache, and without waiting for memory that the drop cannot free
+t_fwu_no_memory() {
+    fwu_release
+    sed -i 's/"size": [0-9]*/"size": 67108864/' "$FWU_SRV/release.json"
+    : > "$W/fwu-srv.log"
+    fwu_download | grep -q '^rc=1' || return 1
+    fwu_json /tmp/fwupdate/download.json 's["error"] == "space" and s["mem"]["available"] < s["mem"]["needed"]
+        and "before_drop" in s["mem"] and s["mem"]["waited"] == 0' &&
+        ! grep -q 'GET /releases/' "$W/fwu-srv.log"
+}
+# The test server stopped: no connection (exit code 2), and the page keeps what the last check found
+t_fwu_no_connection() {
+    fwu_stop
+    r '/usr/libexec/fwupdate check; [ $? = 2 ]' || return 1
+    fwu_json /tmp/fwupdate/status.json 's["error"] == "network" and s["latest"]["tag"] == "'"$FWU_TAG"'"'
+}
+fwu_cleanup() {
+    fwu_stop
+    r 'uci -q delete fwupdate.settings.url; uci commit fwupdate; cp /rom/etc/a5v4_release /etc/a5v4_release
+       cp /rom/usr/lib/os-release /usr/lib/os-release
+       rm -rf /tmp/fwupdate /lib/upgrade/zz-bench.sh; /etc/init.d/fwupdate start' >/dev/null
+}
+# The release name in the firmware version, which 99-a5v4-defaults sets on every flash: LuCI's
+# Overview shows the description of "ubus call system board"
+board_desc() { r 'ubus call system board' | sed -n 's/.*"description": "\(.*\)".*/\1/p'; }
+# The bench image is a local build: no release, the version as built
+t_relname_local() {
+    r 'cmp -s /usr/lib/os-release /rom/usr/lib/os-release' || { echo "os-release changed"; return 1; }
+    board_desc | grep -q '^OpenWrt ' && ! board_desc | grep -q 'a5v4-r'
+}
+# With the release r1 in /etc/a5v4_release, as after a flash; a second run does not add it again
+t_relname_release() {
+    r 'sh /rom/etc/uci-defaults/99-a5v4-defaults' >/dev/null 2>&1
+    board_desc | grep -q '^OpenWrt .* a5v4-r1$' || { board_desc; return 1; }
+}
+t_relname_once() {
+    r 'sh /rom/etc/uci-defaults/99-a5v4-defaults' >/dev/null 2>&1
+    [ "$(board_desc | grep -o 'a5v4-r1' | wc -l)" = 1 ] || { board_desc; return 1; }
+}
+
 # --- PPPoE
 wan_pppoe() {
     r "uci set network.wan.proto=pppoe; uci set network.wan.username=bench; uci set network.wan.password=bench
@@ -756,6 +914,12 @@ if r 'ls /lib/modules/*/mt7603e.ko' >/dev/null 2>&1; then
 else
     skip "router Wi-Fi drivers load" "the image has no mt7603e"
 fi
+if r '[ -x /usr/libexec/fwupdate ]'; then
+    check "update checker at idle: runs, nothing downloaded" t_fwu_idle
+    info "update check at idle: $(r 'cat /tmp/fwupdate/status.json 2>/dev/null || echo "none yet"' | cut -c1-200)"
+else
+    skip "update checker at idle" "the image has no luci-app-fwupdate"
+fi
 
 section "LAN services"
 check "DHCP lease on the LAN" t_lan_dhcp
@@ -811,6 +975,39 @@ else
     check "no IPv6 settings (wan6, ula_prefix, ip6assign)" t_no_ipv6_config
 fi
 offload_run "flow offloading ([OFFLOAD] in conntrack)" dhcp
+
+section "Firmware updates"
+if ! r '[ -x /usr/libexec/fwupdate ]'; then
+    skip "firmware updates" "the image has no luci-app-fwupdate"
+else
+    # the checker stops for the tests, so that its own checks do not run in between
+    r '/etc/init.d/fwupdate stop' >/dev/null
+    wait_for 120 fwu_idle || true
+    check "firmware version without a release: as built ($(board_desc))" t_relname_local
+    r "rm -rf /tmp/fwupdate; printf \"RELEASE='v25.12.5-a5v4-r1'\nREPO=''\nCOMMIT='bench'\n\" > /etc/a5v4_release" >/dev/null
+    check "firmware version with a release: the release after the version" t_relname_release
+    check "firmware version: the release only once after a second run" t_relname_once
+    info "firmware version with the release: $(board_desc)"
+    mkdir -p "$FWU_SRV"
+    fwu_release
+    if fwu_serve; then
+        check "update check: the newer releases with their changes and method (reset)" t_fwu_check
+        check "update notice of the Overview page (LuCI rpc)" t_fwu_notice
+        check "download: size and SHA256 match, sysupgrade of malta refuses the image" t_fwu_download_malta
+        info "sysupgrade -T of malta: $(r 'jsonfilter -i /tmp/fwupdate/download.json -e @.detail')"
+        check "download: ready with a platform check that accepts it, discard frees it" t_fwu_download_ready
+        info "memory (kB) before the download of $(( $(stat -c %s "$FWU_IMG") / 1024 )) KiB: $(tr -d '\n' < "$W/fwu-mem.txt" 2>/dev/null)"
+        check "download: a wrong SHA256 is refused and nothing is kept" t_fwu_bad_checksum
+        check "download: refused without MemAvailable for the image and the margin" t_fwu_no_memory
+        check "update check without the server: no connection, the last result kept" t_fwu_no_connection
+    else
+        check "update test server on the internet host" false
+    fi
+    fwu_cleanup
+    sleep 3
+    check "update checker runs again" t_fwu_idle
+    info "memory of the update checker asleep: $(fwu_daemon_mem)(private/resident)"
+fi
 
 section "PPPoE"
 if [ "$PPPOE_OK" = 1 ]; then

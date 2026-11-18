@@ -1,8 +1,9 @@
 #!/bin/sh
 # Server-side timing of LuCI on the router: the HTML of the Overview page, the ubus calls of the
 # Overview, Wireless and Firewall pages, each page's calls in one JSON-RPC batch as LuCI sends them,
-# and one static script. For the A/B of the build profiles (TODO.md); the numbers include uhttpd,
-# ubusd, rpcd and its ucode plugins, not the browser or the network.
+# and one static script. With luci-app-fwupdate in the image, the Overview batch includes its
+# notice call, which is also timed alone. For the A/B of the build profiles (TODO.md); the
+# numbers include uhttpd, ubusd, rpcd and its ucode plugins, not the browser or the network.
 #
 # Runs on the router itself (curl is in the image):
 #   ssh root@192.168.1.1 sh -s [rounds] < tests/router/luci-bench.sh
@@ -32,6 +33,7 @@ ubus call session set "{\"ubus_rpc_session\":\"$sid\",\"values\":{\"username\":\
 
 # JSON-RPC batches: one line per call, "object method arguments"
 devices="$(ubus call iwinfo devices | jsonfilter -e '@.devices[*]')"
+fwupdate="$(ubus list luci.fwupdate 2>/dev/null)"
 {
 	for c in "luci getVersion" "luci getUnixtime" "system board" "system info" "luci getMountPoints" \
 	         "luci getBuiltinEthernetPorts" "network.device status" "network.interface dump" \
@@ -41,7 +43,10 @@ devices="$(ubus call iwinfo devices | jsonfilter -e '@.devices[*]')"
 	done
 	for c in network wireless dhcp firewall; do echo "uci get {\"config\":\"$c\"}"; done
 	for d in $devices; do echo "iwinfo assoclist {\"device\":\"$d\"}"; done
+	# the notice of luci-app-fwupdate, when the image has it
+	[ -n "$fwupdate" ] && echo "luci.fwupdate notice {}"
 } > "$T/overview.calls"
+[ -n "$fwupdate" ] && echo "luci.fwupdate notice {}" > "$T/fwupdate.calls"
 {
 	echo "luci-rpc getWirelessDevices {}"
 	echo "network.interface dump {}"
@@ -56,7 +61,8 @@ devices="$(ubus call iwinfo devices | jsonfilter -e '@.devices[*]')"
 	echo "luci-rpc getNetworkDevices {}"
 	for c in firewall network; do echo "uci get {\"config\":\"$c\"}"; done
 } > "$T/firewall.calls"
-for page in overview wireless firewall; do
+pages="overview wireless firewall${fwupdate:+ fwupdate}"
+for page in $pages; do
 	n=0
 	while read -r obj method args; do
 		n=$((n + 1))
@@ -97,7 +103,7 @@ fi
 echo "$(grep -E 'MemAvailable' /proc/meminfo | tr -s ' ') before; $ROUNDS rounds"
 measure "Overview, HTML (ucode dispatcher)" -H "Cookie: sysauth_http=$sid" "$URL/cgi-bin/luci/admin/status/overview"
 measure "Login page, HTML" "$URL/cgi-bin/luci/"
-for page in overview wireless firewall; do
+for page in $pages; do
 	measure "$page, ubus batch ($(wc -l < "$T/$page.calls") calls)" \
 		-H 'Content-Type: application/json' --data-binary @"$T/$page.json" "$URL/ubus"
 done

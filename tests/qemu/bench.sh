@@ -1020,11 +1020,23 @@ wifi_defaults_radio() { # $1 = number of the radio
         *) echo "radio$n: $band $out"; return 1 ;;
     esac
     r "uci -q get wireless.default_radio$n.ssid" | grep -q -- "-$band-$n" || { echo "radio$n: SSID"; return 1; }
+    local acs_2g_bias="1:0.6 6:0.6 11:0.6"
+    if [ "$band" = 2g ]; then
+        [ "$(r "uci -q get wireless.radio$n.channels" | tr -d '\r\n')" = "1-11" ] || { echo "radio$n channels != 1-11"; return 1; }
+        [ "$(r "uci -q get wireless.radio$n.hostapd_options" | tr -d '\r\n')" = "acs_num_scans=2" ] || { echo "radio$n hostapd_options != acs_num_scans=2"; return 1; }
+        [ -z "$acs_2g_bias" ] || [ "$(r "uci -q get wireless.radio$n.acs_chan_bias" | tr -d '\r\n')" = "$acs_2g_bias" ] || { echo "radio$n bias mismatch"; return 1; }
+    elif [ "$band" = 5g ]; then
+        [ "$(r "uci -q get wireless.radio$n.acs_exclude_dfs" | tr -d '\r\n')" = "1" ] || { echo "radio$n acs_exclude_dfs != 1"; return 1; }
+        [ -z "$(r "uci -q get wireless.radio$n.channels" | tr -d '\r\n')" ] || { echo "radio$n channels not empty"; return 1; }
+        [ "$(r "uci -q get wireless.radio$n.hostapd_options" | tr -d '\r\n')" = "acs_num_scans=1 min_tx_power=15" ] || { echo "radio$n hostapd_options != acs_num_scans=1 min_tx_power=15"; return 1; }
+    fi
 }
 t_wifi_defaults() { wifi_defaults_radio 0 && wifi_defaults_radio 1; }
 # The radios of mac80211_hwsim come up on 6 GHz: run the script again with the bands of the router
 t_wifi_defaults_router_bands() {
     r "uci -q delete wireless.default_radio0.key; uci -q delete wireless.default_radio1.key
+       uci -q delete wireless.radio0.channels; uci -q delete wireless.radio0.hostapd_options; uci -q delete wireless.radio0.acs_chan_bias
+       uci -q delete wireless.radio1.channels; uci -q delete wireless.radio1.hostapd_options; uci -q delete wireless.radio1.acs_exclude_dfs
        uci set wireless.radio0.band=2g; uci set wireless.radio1.band=5g; uci commit wireless
        sh /rom/etc/uci-defaults/77_wireless" >/dev/null
     wifi_defaults_radio 0 && wifi_defaults_radio 1
@@ -1448,6 +1460,364 @@ if [ "$SAE" = yes ]; then
     fi
 else
     skip "WPA3" "hostapd of the image has no SAE"
+fi
+
+# --- Wi-Fi ACS (mac80211_hwsim): automatic channel selection and acs_scan_duration
+# Measure ACS start -> AP-ENABLED in ms via /proc/uptime while logread -f follows hostapd.
+acs_ap_gone() { ! r 'iw dev phy0-ap0 info >/dev/null 2>&1'; }
+acs_ap_done() { r 'grep -q "AP-ENABLED" /tmp/acs-lr.log 2>/dev/null'; }
+acs_run() {
+    local chan="$1" scans="$2" dur="$3"
+    r "uci set wireless.radio1.disabled=1
+       uci set wireless.radio0.channel='$chan'
+       uci -q delete wireless.radio0.channels
+       uci add_list wireless.radio0.channels='1-11'
+       uci -q delete wireless.radio0.hostapd_options
+       [ -n '$scans' ] && uci add_list wireless.radio0.hostapd_options='acs_num_scans=$scans'
+       [ -n '$dur' ] && uci add_list wireless.radio0.hostapd_options='acs_scan_duration=$dur'
+       uci commit wireless
+       wifi down radio0" >/dev/null
+    wait_for 30 acs_ap_gone || true
+    r "rm -f /tmp/acs-lr.log /tmp/acs-ms /tmp/acs-lr.pid
+       sh -c 'echo \$\$ > /tmp/acs-lr.pid; exec logread -f' | {
+           t0=''
+           while IFS= read -r line; do
+               printf '%s\n' \"\$line\" >> /tmp/acs-lr.log
+               case \"\$line\" in
+                   *'ACS: Automatic channel selection started'*|*'ACS-STARTED'*)
+                       [ -n \"\$t0\" ] || read -r t0 _ < /proc/uptime ;;
+                   *'AP-ENABLED'*)
+                       read -r t1 _ < /proc/uptime
+                       [ -n \"\$t0\" ] && awk -v a=\"\$t0\" -v b=\"\$t1\" 'BEGIN{printf \"%.0f\n\", (b-a)*1000}' > /tmp/acs-ms
+                       ;;
+               esac
+           done
+       } >/dev/null 2>&1 &
+       sleep 1
+       wifi up radio0" >/dev/null
+    wait_for 60 acs_ap_done
+    local rc=$?
+    sleep 1
+    r 'kill "$(cat /tmp/acs-lr.pid 2>/dev/null)" 2>/dev/null || true; rm -f /tmp/acs-lr.pid' >/dev/null
+    return "$rc"
+}
+acs_log_clean() {
+    ! r 'grep -iE "unknown configuration item|invalid acs_|Line [0-9]+:.*(invalid|error)|ACS: Failed|ACS-FAILED" /tmp/acs-lr.log'
+}
+acs_survey_dump() {
+    r 'iw dev phy0-ap0 survey dump'
+}
+ACS_BASE_MS=""
+ACS_DUR0_MS=""
+ACS_DUR300_MS=""
+t_acs_base() {
+    local ms ch surv
+    acs_run auto 1 "" || return 1
+    acs_log_clean || return 1
+    r 'grep -q "ACS-COMPLETED" /tmp/acs-lr.log' || { r 'cat /tmp/acs-lr.log'; return 1; }
+    ms="$(r 'cat /tmp/acs-ms 2>/dev/null' | tr -d '\r\n')"
+    [ -n "$ms" ] || { echo "missing ACS duration"; r 'cat /tmp/acs-lr.log'; return 1; }
+    ch="$(r "iw dev phy0-ap0 info" | sed -n 's/.*channel \([0-9]*\).*/\1/p')"
+    [ -n "$ch" ] && [ "$ch" -ge 1 ] && [ "$ch" -le 11 ] || { echo "unexpected channel: $ch"; return 1; }
+    surv="$(acs_survey_dump | grep -E 'frequency:|channel active time:|channel busy time:|noise:' | head -12 | tr '\n' ' ')"
+    printf '%s\n' "$ms" > "$W/acs-base-ms"
+    printf '%s\n' "$ch" > "$W/acs-base-ch"
+    printf '%s\n' "$surv" > "$W/acs-base-surv"
+}
+t_acs_dur0() {
+    local ms base_ms
+    acs_run auto 1 0 || return 1
+    acs_log_clean || return 1
+    r 'grep -q "ACS-COMPLETED" /tmp/acs-lr.log' || return 1
+    ms="$(r 'cat /tmp/acs-ms 2>/dev/null' | tr -d '\r\n')"
+    [ -n "$ms" ] || { echo "missing ACS duration"; return 1; }
+    base_ms="$(cat "$W/acs-base-ms")"
+    [ "$ms" -lt $((base_ms + 1000)) ] && [ "$base_ms" -lt $((ms + 1000)) ] || {
+        echo "acs_scan_duration=0 ($ms ms) differed from default ($base_ms ms) by >= 1000 ms"
+        return 1
+    }
+    printf '%s\n' "$ms" > "$W/acs-dur0-ms"
+}
+t_acs_dur300() {
+    local ms base_ms dur0_ms surv
+    acs_run auto 1 300 || return 1
+    acs_log_clean || return 1
+    r 'grep -q "ACS-COMPLETED" /tmp/acs-lr.log' || return 1
+    ms="$(r 'cat /tmp/acs-ms 2>/dev/null' | tr -d '\r\n')"
+    [ -n "$ms" ] || { echo "missing ACS duration"; return 1; }
+    base_ms="$(cat "$W/acs-base-ms")"
+    dur0_ms="$(cat "$W/acs-dur0-ms")"
+    # 11 channels * (300 - 110) ms = ~2090 ms extra; allow a wide margin on TCG
+    [ "$ms" -ge $((base_ms + 1000)) ] && [ "$ms" -ge $((dur0_ms + 1000)) ] || {
+        echo "acs_scan_duration=300 ($ms ms) did not exceed baseline ($base_ms / $dur0_ms ms) by >= 1000 ms"
+        return 1
+    }
+    surv="$(acs_survey_dump | grep -E 'frequency:|channel active time:|channel busy time:|noise:' | head -12 | tr '\n' ' ')"
+    printf '%s\n' "$ms" > "$W/acs-dur300-ms"
+    printf '%s\n' "$surv" > "$W/acs-dur300-surv"
+}
+t_acs_fixed_chan() {
+    local info conf
+    acs_run 1 1 300 || return 1
+    acs_log_clean || return 1
+    ! r 'grep -qE "ACS-STARTED|ACS-COMPLETED" /tmp/acs-lr.log' || { echo "ACS ran on fixed channel"; return 1; }
+    conf="$(r 'cat /var/run/hostapd-phy0.conf')"
+    echo "$conf" | grep -q '^channel=1$' || { echo "$conf"; return 1; }
+    echo "$conf" | grep -q '^chanlist=1-11$' || { echo "$conf"; return 1; }
+    echo "$conf" | grep -q '^acs_num_scans=1$' || { echo "$conf"; return 1; }
+    info="$(r 'iw dev phy0-ap0 info')"
+    echo "$info" | grep -q 'channel 1 (2412 MHz)' || { echo "$info"; return 1; }
+    echo "$info" | grep -q 'width: 20 MHz' || { echo "$info"; return 1; }
+}
+t_acs_preset_hostapd_conf() {
+    local conf conf5 cnt avail
+    r "uci set wireless.radio1.disabled=1
+       uci set wireless.radio0.band=2g; uci set wireless.radio0.channel=auto; uci set wireless.radio0.htmode=HT20
+       uci -q delete wireless.radio0.channels; uci add_list wireless.radio0.channels='1-11'
+       uci set wireless.radio0.acs_chan_bias='1:0.6 6:0.6 11:0.6'
+       uci -q delete wireless.radio0.hostapd_options; uci add_list wireless.radio0.hostapd_options='acs_num_scans=2'
+       uci commit wireless; wifi down radio0" >/dev/null
+    wait_for 30 acs_ap_gone || true
+    r "rm -f /tmp/acs-lr.log /tmp/acs-ms /tmp/acs-lr.pid
+       sh -c 'echo \$\$ > /tmp/acs-lr.pid; exec logread -f' > /tmp/acs-lr.log 2>&1 &
+       sleep 1; wifi up radio0" >/dev/null
+    wait_for 60 acs_ap_done || { r 'kill $(cat /tmp/acs-lr.pid 2>/dev/null) 2>/dev/null || true'; return 1; }
+    r 'kill $(cat /tmp/acs-lr.pid 2>/dev/null) 2>/dev/null || true; rm -f /tmp/acs-lr.pid' >/dev/null
+    conf="$(r 'cat /var/run/hostapd-phy0.conf')"
+    echo "$conf" | grep -q '^channel=0$' || { echo "$conf"; return 1; }
+    echo "$conf" | grep -q '^chanlist=1-11$' || { echo "$conf"; return 1; }
+    echo "$conf" | grep -q '^acs_num_scans=2$' || { echo "$conf"; return 1; }
+    echo "$conf" | grep -q '^acs_chan_bias=1:0\.6 6:0\.6 11:0\.6$' || { echo "$conf"; return 1; }
+
+    # 5 GHz presets on PA: min_tx_power=15 + acs_exclude_dfs=1 still scans all enabled PA channels.
+    # Use VHT20 so hostapd skips post-ACS HT_SCAN (which resets hwsim survey_data).
+    r "uci set wireless.radio0.disabled=1
+       uci set wireless.radio1.disabled=0; uci set wireless.radio1.band=5g; uci set wireless.radio1.htmode=VHT20
+       uci set wireless.radio1.country=PA; uci set wireless.radio1.channel=auto; uci set wireless.radio1.acs_exclude_dfs=1
+       uci -q delete wireless.radio1.channels; uci -q delete wireless.radio1.hostapd_options
+       uci add_list wireless.radio1.hostapd_options='acs_num_scans=1'
+       uci add_list wireless.radio1.hostapd_options='min_tx_power=15'
+       uci set wireless.default_radio1.disabled=0; uci set wireless.default_radio1.mode=ap; uci set wireless.default_radio1.network=lan
+       uci set wireless.default_radio1.ssid=pa-acs; uci set wireless.default_radio1.encryption=psk2
+       uci set wireless.default_radio1.key=bench-pass-1
+       uci commit wireless; wifi down" >/dev/null
+    wait_for 30 phy1_gone || true
+    r "rm -f /tmp/acs-de.log /tmp/acs-de.pid
+       sh -c 'echo \$\$ > /tmp/acs-de.pid; exec logread -f' > /tmp/acs-de.log 2>&1 &
+       sleep 1; wifi up radio1" >/dev/null
+    wait_for 30 phy1_done || { r 'kill $(cat /tmp/acs-de.pid 2>/dev/null) 2>/dev/null || true; cat /tmp/acs-de.log'; return 1; }
+    r 'kill $(cat /tmp/acs-de.pid 2>/dev/null) 2>/dev/null || true; rm -f /tmp/acs-de.pid' >/dev/null
+    conf5="$(r 'cat /var/run/hostapd-phy1.conf')"
+    echo "$conf5" | grep -q '^acs_exclude_dfs=1$' || { echo "$conf5"; return 1; }
+    echo "$conf5" | grep -q '^acs_num_scans=1$' || { echo "$conf5"; return 1; }
+    echo "$conf5" | grep -q '^min_tx_power=15$' || { echo "$conf5"; return 1; }
+    avail="$(r 'iw phy phy1 info' | grep -E '5[0-9]{3}\.0 MHz' | grep -vc '(disabled)')"
+    cnt="$(r 'iw dev phy1-ap0 survey dump' | awk '/frequency:/{f=$2} /channel active time:/{if (f>=5000 && $4+0>0) c++} END{print c+0}')"
+    printf '%s/%s\n' "$cnt" "$avail" > "$W/acs-pa-cnt"
+    [ "$avail" -ge 24 ] && [ "$cnt" = "$avail" ] || { echo "PA 5 GHz surveyed channels: $cnt != $avail"; return 1; }
+}
+t_acs_migration() {
+    r '
+    cp /etc/config/wireless /tmp/w.bak
+    cp /etc/config/a5v4 /tmp/a.bak
+    uci -q delete a5v4.defaults.acs; uci commit a5v4
+    uci set wireless.radio0.band=2g; uci set wireless.radio0.channel=1
+    uci -q delete wireless.radio0.channels; uci -q delete wireless.radio0.acs_chan_bias
+    uci -q delete wireless.radio0.hostapd_options; uci add_list wireless.radio0.hostapd_options="foo=bar"
+    uci set wireless.radio1.band=5g; uci set wireless.radio1.channel=36
+    uci -q delete wireless.radio1.acs_exclude_dfs; uci -q delete wireless.radio1.hostapd_options
+    uci commit wireless
+    sh /rom/etc/uci-defaults/99-a5v4-defaults
+    ok=1
+    [ "$(uci -q get wireless.radio0.channels)" = "1-11" ] || ok=0
+    [ "$(uci -q get wireless.radio0.acs_chan_bias)" = "1:0.6 6:0.6 11:0.6" ] || ok=0
+    [ "$(uci -q get wireless.radio0.hostapd_options)" = "foo=bar acs_num_scans=2" ] || ok=0
+    [ "$(uci -q get wireless.radio1.acs_exclude_dfs)" = "1" ] || ok=0
+    [ "$(uci -q get wireless.radio1.hostapd_options)" = "acs_num_scans=1 min_tx_power=15" ] || ok=0
+    [ "$(uci -q get a5v4.defaults.acs)" = "1" ] || ok=0
+    # Second run changes nothing
+    before="$(uci export wireless)"
+    sh /rom/etc/uci-defaults/99-a5v4-defaults
+    [ "$before" = "$(uci export wireless)" ] || ok=0
+    # User values are preserved even if marker is absent
+    uci -q delete a5v4.defaults.acs; uci commit a5v4
+    uci -q delete wireless.radio0.channels; uci add_list wireless.radio0.channels="1 6 11"
+    uci set wireless.radio0.acs_chan_bias="1:0.5"
+    uci -q delete wireless.radio0.hostapd_options; uci add_list wireless.radio0.hostapd_options="acs_num_scans=4"
+    uci set wireless.radio1.acs_exclude_dfs="0"
+    uci -q delete wireless.radio1.hostapd_options
+    uci add_list wireless.radio1.hostapd_options="acs_num_scans=3"
+    uci add_list wireless.radio1.hostapd_options="min_tx_power=18"
+    uci commit wireless
+    sh /rom/etc/uci-defaults/99-a5v4-defaults
+    [ "$(uci -q get wireless.radio0.channels)" = "'"'1 6 11'"'" ] || ok=0
+    [ "$(uci -q get wireless.radio0.acs_chan_bias)" = "1:0.5" ] || ok=0
+    [ "$(uci -q get wireless.radio0.hostapd_options)" = "acs_num_scans=4" ] || ok=0
+    [ "$(uci -q get wireless.radio1.acs_exclude_dfs)" = "0" ] || ok=0
+    [ "$(uci -q get wireless.radio1.hostapd_options)" = "acs_num_scans=3 min_tx_power=18" ] || ok=0
+    cp /tmp/w.bak /etc/config/wireless; cp /tmp/a.bak /etc/config/a5v4
+    rm -f /tmp/w.bak /tmp/a.bak
+    [ "$ok" = 1 ]
+    '
+}
+t_acs_luci() {
+    local cj code js
+    cj="$(mktemp)"
+    nsx lan curl -s -o /dev/null -c "$cj" -d "luci_username=root&luci_password=" http://192.168.1.1/cgi-bin/luci/
+    code="$(nsx lan curl -s -o /dev/null -w '%{http_code}' -b "$cj" http://192.168.1.1/cgi-bin/luci/admin/network/wireless)"
+    rm -f "$cj"
+    [ "$code" = 200 ] || { echo "wireless page status: $code"; return 1; }
+    js="$(nsx lan curl -s --max-time 60 http://192.168.1.1/luci-static/resources/view/network/wireless.js)"
+    echo "$js" | grep -q 'acs_exclude_dfs' || { echo "missing acs_exclude_dfs in wireless.js"; return 1; }
+    echo "$js" | grep -q 'Include channels 12 and 13 in automatic channel selection' || { echo "missing 12-13 label in wireless.js"; return 1; }
+    echo "$js" | grep -q 'Where every 5 GHz channel needs a radar check, automatic selection works only with this box on' || { echo "missing all-DFS note in wireless.js"; return 1; }
+    r 'grep -q "Автовыбор включая DFS-каналы" /usr/lib/lua/luci/i18n/base.ru.lmo && grep -q "Автовыбор включая каналы 12 и 13" /usr/lib/lua/luci/i18n/base.ru.lmo && grep -q "автовыбор работает только с этой галочкой" /usr/lib/lua/luci/i18n/base.ru.lmo' || {
+        echo "missing Russian strings in base.ru.lmo"; return 1
+    }
+}
+phy1_gone() { ! r 'iw dev phy1-ap0 info >/dev/null 2>&1'; }
+phy1_done() { r 'grep -q "phy1-ap0: AP-ENABLED" /tmp/acs-de.log 2>/dev/null'; }
+t_acs_de_dfs() {
+    local ch t0 t1 freqs surveyed_5g ch_vht80
+    # Run VHT20 first so post-ACS HT_SCAN does not wipe hwsim survey_data, proving 149-173 stay unvisited
+    r "uci set wireless.radio0.disabled=1
+       uci set wireless.radio1.disabled=0; uci set wireless.radio1.band=5g; uci set wireless.radio1.htmode=VHT20
+       uci set wireless.radio1.country=DE; uci set wireless.radio1.channel=auto; uci set wireless.radio1.acs_exclude_dfs=1
+       uci -q delete wireless.radio1.channels; uci -q delete wireless.radio1.hostapd_options
+       uci add_list wireless.radio1.hostapd_options=acs_num_scans=1
+       uci add_list wireless.radio1.hostapd_options=min_tx_power=15
+       uci set wireless.default_radio1.disabled=0; uci set wireless.default_radio1.mode=ap; uci set wireless.default_radio1.network=lan
+       uci set wireless.default_radio1.ssid=de-acs; uci set wireless.default_radio1.encryption=psk2
+       uci set wireless.default_radio1.key=bench-pass-1
+       uci commit wireless; wifi down" >/dev/null
+    wait_for 30 phy1_gone || true
+    r "rm -f /tmp/acs-de.log /tmp/acs-de.pid
+       sh -c 'echo \$\$ > /tmp/acs-de.pid; exec logread -f' > /tmp/acs-de.log 2>&1 &
+       sleep 1; wifi up radio1" >/dev/null
+    t0="$(date +%s)"
+    wait_for 30 phy1_done
+    local rc=$?
+    t1="$(date +%s)"
+    r 'kill $(cat /tmp/acs-de.pid 2>/dev/null) 2>/dev/null || true; rm -f /tmp/acs-de.pid' >/dev/null
+    [ "$rc" = 0 ] || { r 'cat /tmp/acs-de.log'; return 1; }
+    ch="$(r 'iw dev phy1-ap0 info' | sed -n 's/.*channel \([0-9]*\).*/\1/p')"
+    surveyed_5g="$(r 'iw dev phy1-ap0 survey dump' | awk '/frequency:/{f=$2} /channel active time:/{if (f>=5000 && $4+0>0) printf "%s=%s ", f, $4}')"
+    freqs="$(r 'iw phy phy1 info' | sed -n '/5180\.0 MHz/,/5870\.0 MHz/p' | grep -E 'MHz \[' | tr '\n' ';')"
+    printf '%s\n' "$ch" > "$W/acs-de-ch"
+    printf '%s\n' "$((t1 - t0))" > "$W/acs-de-s"
+    printf '%s\n' "$freqs" > "$W/acs-de-freqs"
+    printf '%s\n' "$surveyed_5g" > "$W/acs-de-surv"
+    r 'grep -q "acs_exclude_dfs=1" /var/run/hostapd-phy1.conf && grep -q "min_tx_power=15" /var/run/hostapd-phy1.conf' || return 1
+    [ -n "$ch" ] && [ "$ch" -ge 36 ] && [ "$ch" -le 48 ] || { echo "DE ch $ch not in 36-48"; return 1; }
+    case "$surveyed_5g" in
+        *5745=*|*5765=*|*5785=*|*5805=*|*5825=*|*5845=*|*5855=*|*5860=*|*5865=*)
+            echo "DE 149-173 surveyed unexpectedly: $surveyed_5g"; return 1 ;;
+    esac
+    # Confirm VHT80 also skips DFS CAC and lands in 36-48
+    r "uci set wireless.radio1.htmode=VHT80; uci commit wireless; wifi down" >/dev/null
+    wait_for 30 phy1_gone || true
+    r "rm -f /tmp/acs-de.log /tmp/acs-de.pid
+       sh -c 'echo \$\$ > /tmp/acs-de.pid; exec logread -f' > /tmp/acs-de.log 2>&1 &
+       sleep 1; wifi up radio1" >/dev/null
+    wait_for 30 phy1_done || { r 'kill $(cat /tmp/acs-de.pid 2>/dev/null) 2>/dev/null || true; cat /tmp/acs-de.log'; return 1; }
+    r 'kill $(cat /tmp/acs-de.pid 2>/dev/null) 2>/dev/null || true; rm -f /tmp/acs-de.pid' >/dev/null
+    ch_vht80="$(r 'iw dev phy1-ap0 info' | sed -n 's/.*channel \([0-9]*\).*/\1/p')"
+    [ -n "$ch_vht80" ] && [ "$ch_vht80" -ge 36 ] && [ "$ch_vht80" -le 48 ] || { echo "DE VHT80 ch $ch_vht80 not in 36-48"; return 1; }
+}
+am_nochan() { r 'grep -q "ACS: No available channels found" /tmp/acs-am.log 2>/dev/null && grep -q "AP-DISABLED" /tmp/acs-am.log 2>/dev/null'; }
+am_cac() { r 'grep -q "DFS-CAC-START" /tmp/acs-am2.log 2>/dev/null'; }
+t_acs_am_dfs() {
+    local nochan cac
+    r "uci set wireless.radio0.disabled=1
+       uci set wireless.radio1.disabled=0; uci set wireless.radio1.band=5g; uci set wireless.radio1.htmode=VHT80
+       uci set wireless.radio1.country=AM; uci set wireless.radio1.channel=auto; uci set wireless.radio1.acs_exclude_dfs=1
+       uci -q delete wireless.radio1.channels; uci -q delete wireless.radio1.hostapd_options
+       uci add_list wireless.radio1.hostapd_options=acs_num_scans=1
+       uci add_list wireless.radio1.hostapd_options=min_tx_power=15
+       uci commit wireless; wifi down" >/dev/null
+    wait_for 30 phy1_gone || true
+    r "rm -f /tmp/acs-am.log /tmp/acs-am.pid
+       sh -c 'echo \$\$ > /tmp/acs-am.pid; exec logread -f' > /tmp/acs-am.log 2>&1 &
+       sleep 1; wifi up radio1" >/dev/null
+    wait_for 20 am_nochan
+    local rc1=$?
+    r 'kill $(cat /tmp/acs-am.pid 2>/dev/null) 2>/dev/null || true; rm -f /tmp/acs-am.pid' >/dev/null
+    [ "$rc1" = 0 ] || { r 'cat /tmp/acs-am.log'; return 1; }
+    ! r 'iw dev phy1-ap0 info 2>/dev/null | grep -q channel' || { echo "AM AP came up on a channel despite acs_exclude_dfs=1"; return 1; }
+    nochan="$(r 'grep "ACS: No available channels found" /tmp/acs-am.log | head -n 1')"
+    printf '%s\n' "$nochan" > "$W/acs-am-nochan"
+
+    # With acs_exclude_dfs=0, ACS enters DFS-CAC-START (skip waiting out the 60 s CAC in hwsim)
+    r "uci set wireless.radio1.acs_exclude_dfs=0; uci commit wireless; wifi down" >/dev/null
+    wait_for 15 phy1_gone || true
+    r "rm -f /tmp/acs-am2.log /tmp/acs-am2.pid
+       sh -c 'echo \$\$ > /tmp/acs-am2.pid; exec logread -f' > /tmp/acs-am2.log 2>&1 &
+       sleep 1; wifi up radio1" >/dev/null
+    wait_for 25 am_cac
+    local rc2=$?
+    r 'kill $(cat /tmp/acs-am2.pid 2>/dev/null) 2>/dev/null || true; rm -f /tmp/acs-am2.pid' >/dev/null
+    [ "$rc2" = 0 ] || { r 'cat /tmp/acs-am2.log'; return 1; }
+    cac="$(r 'grep "DFS-CAC-START" /tmp/acs-am2.log | head -n 1')"
+    printf '%s\n' "$cac" > "$W/acs-am-cac"
+}
+t_acs_restore_wifi() {
+    r "rm -f /tmp/acs-lr.log /tmp/acs-ms /tmp/acs-lr.pid /tmp/acs-de.log /tmp/acs-de.pid /tmp/acs-am.log /tmp/acs-am.pid /tmp/acs-am2.log /tmp/acs-am2.pid
+       uci set wireless.radio0.disabled=0; uci set wireless.radio1.disabled=0
+       for radio in radio0 radio1; do
+           uci set wireless.\$radio.band=2g; uci set wireless.\$radio.channel=1; uci set wireless.\$radio.htmode=HT20
+           uci set wireless.\$radio.country=PA
+           uci -q delete wireless.\$radio.channels; uci -q delete wireless.\$radio.acs_chan_bias
+           uci -q delete wireless.\$radio.acs_exclude_dfs; uci -q delete wireless.\$radio.hostapd_options
+       done
+       uci set wireless.default_radio0.mode=ap; uci set wireless.default_radio0.ssid=bench-ap
+       uci set wireless.default_radio0.encryption=psk2; uci set wireless.default_radio0.key=bench-pass-1
+       uci set wireless.default_radio1.mode=sta; uci set wireless.default_radio1.ssid=bench-ap
+       uci set wireless.default_radio1.encryption=psk2; uci set wireless.default_radio1.key=bench-pass-1
+       uci set wireless.default_radio1.network=wwan
+       uci commit wireless
+       wifi down" >/dev/null
+    wait_for 30 sta_gone || true
+    r 'wifi up' >/dev/null
+    t_wifi_wpa2
+}
+section "Wi-Fi ACS"
+if r 'grep -qa acs_scan_duration /usr/sbin/wpad'; then
+    check "ACS with channels and acs_num_scans=1 brings AP up (ACS-COMPLETED, no option errors)" t_acs_base
+    ACS_BASE_MS="$(cat "$W/acs-base-ms" 2>/dev/null || true)"
+    ACS_BASE_CHAN="$(cat "$W/acs-base-ch" 2>/dev/null || true)"
+    ACS_BASE_SURVEY="$(cat "$W/acs-base-surv" 2>/dev/null || true)"
+    [ -n "$ACS_BASE_MS" ] && info "ACS (1-11, 1 scan, default dwell) -> ch ${ACS_BASE_CHAN:-?}, ACS start to AP-ENABLED: $ACS_BASE_MS ms"
+    [ -n "$ACS_BASE_SURVEY" ] && info "hwsim survey (default dwell): $ACS_BASE_SURVEY"
+    check "ACS with acs_scan_duration=0 starts as without the option" t_acs_dur0
+    ACS_DUR0_MS="$(cat "$W/acs-dur0-ms" 2>/dev/null || true)"
+    [ -n "$ACS_DUR0_MS" ] && info "ACS (1-11, 1 scan, acs_scan_duration=0): $ACS_DUR0_MS ms"
+    check "ACS with acs_scan_duration=300 increases ACS duration (11 ch * ~190 ms)" t_acs_dur300
+    ACS_DUR300_MS="$(cat "$W/acs-dur300-ms" 2>/dev/null || true)"
+    ACS_DUR300_SURVEY="$(cat "$W/acs-dur300-surv" 2>/dev/null || true)"
+    [ -n "$ACS_DUR300_MS" ] && info "ACS (1-11, 1 scan, acs_scan_duration=300): $ACS_DUR300_MS ms (delta $((ACS_DUR300_MS - ACS_BASE_MS)) ms)"
+    [ -n "$ACS_DUR300_SURVEY" ] && info "hwsim survey (acs_scan_duration=300): $ACS_DUR300_SURVEY"
+    check "Fixed channel ignores acs_num_scans and acs_scan_duration (channel 1, 20 MHz)" t_acs_fixed_chan
+    check "ACS presets write chanlist=1-11, bias, min_tx_power=15 and scan all PA channels" t_acs_preset_hostapd_conf
+    PA_CNT="$(cat "$W/acs-pa-cnt" 2>/dev/null || true)"
+    [ -n "$PA_CNT" ] && info "PA 5 GHz surveyed channels with min_tx_power=15: $PA_CNT"
+    check "99-a5v4-defaults migrates ACS presets once and preserves user options" t_acs_migration
+    check "LuCI wireless page and base.ru.lmo have ACS DFS and ch 12-13 options" t_acs_luci
+    check "Country DE with acs_exclude_dfs=1 and min_tx_power=15 picks 36-48 and skips 149-173" t_acs_de_dfs
+    DE_CH="$(cat "$W/acs-de-ch" 2>/dev/null || true)"
+    DE_S="$(cat "$W/acs-de-s" 2>/dev/null || true)"
+    DE_SURV="$(cat "$W/acs-de-surv" 2>/dev/null || true)"
+    DE_FREQS="$(cat "$W/acs-de-freqs" 2>/dev/null || true)"
+    [ -n "$DE_CH" ] && info "DE 5 GHz acs_exclude_dfs=1 min_tx_power=15 landed on ch $DE_CH (${DE_S:-?} s)"
+    [ -n "$DE_SURV" ] && info "DE 5 GHz surveyed channels (VHT20): $DE_SURV"
+    [ -n "$DE_FREQS" ] && info "DE 5 GHz regdb on hwsim: $DE_FREQS"
+    check "Country AM (all DFS): no channels when DFS excluded, CAC starts when DFS enabled" t_acs_am_dfs
+    AM_NOCHAN="$(cat "$W/acs-am-nochan" 2>/dev/null || true)"
+    AM_CAC="$(cat "$W/acs-am-cac" 2>/dev/null || true)"
+    [ -n "$AM_NOCHAN" ] && info "AM (acs_exclude_dfs=1): $AM_NOCHAN"
+    [ -n "$AM_CAC" ] && info "AM (acs_exclude_dfs=0, 60 s hwsim CAC wait skipped): $AM_CAC"
+    check "Wi-Fi restored to bench configuration and client re-associated" t_acs_restore_wifi
+else
+    skip "Wi-Fi ACS" "wpad of the image has no acs_scan_duration"
 fi
 
 section "Persistence"

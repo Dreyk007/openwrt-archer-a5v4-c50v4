@@ -19,13 +19,25 @@ radio_enable() {
 	if [ -n "$country" ]; then
 		uci set wireless.radio$num.country=$country
 	fi
-	# 2.4 GHz: 20 MHz on channel 1; 5 GHz: 80 MHz on channel 36, which needs no DFS
+	local acs_2g_bias='1:0.6 6:0.6 11:0.6'
+	# 2.4 GHz: 20 MHz on channel 1; 5 GHz: 80 MHz on channel 36, which needs no DFS.
+	# ACS presets take effect only when the user chooses channel "auto".
 	if [ "$band" = "2g" ]; then
 		uci set wireless.radio$num.channel='1'
 		uci set wireless.radio$num.htmode='HT20'
+		uci -q delete wireless.radio$num.channels
+		uci add_list wireless.radio$num.channels='1-11'
+		uci -q delete wireless.radio$num.hostapd_options
+		uci add_list wireless.radio$num.hostapd_options='acs_num_scans=2'
+		[ -n "$acs_2g_bias" ] && uci set wireless.radio$num.acs_chan_bias="$acs_2g_bias"
 	elif [ "$band" = "5g" ]; then
 		uci set wireless.radio$num.channel='36'
 		uci set wireless.radio$num.htmode='VHT80'
+		uci -q delete wireless.radio$num.hostapd_options
+		uci add_list wireless.radio$num.hostapd_options='acs_num_scans=1'
+		# min_tx_power=15 skips EU 25 mW (13 dBm) channels 149-173; router cap is 22 dBm, PA/RU/UA/BY/KZ/US >= 20 dBm.
+		uci add_list wireless.radio$num.hostapd_options='min_tx_power=15'
+		uci set wireless.radio$num.acs_exclude_dfs='1'
 	fi
 	if [ -z "$ssid" ]; then
 		ssid="$( board_name | cut -d ',' -f2- )"

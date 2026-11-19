@@ -35,6 +35,39 @@ if [ -f /etc/config/https-dns-proxy ] && [ "$(uci -q get a5v4.defaults.doh)" != 
 	uci -q commit a5v4
 fi
 
+# Presets for automatic channel selection (effective only when the user picks channel "auto"):
+# keep fixed channels and any user-configured ACS options untouched.
+if [ -f /etc/config/wireless ] && [ "$(uci -q get a5v4.defaults.acs)" != "1" ]; then
+	acs_2g_bias='1:0.6 6:0.6 11:0.6'
+	for sec in $(uci -q show wireless | sed -n "s/^wireless\.\([^.]*\)=wifi-device$/\1/p"); do
+		band="$(uci -q get wireless."$sec".band)"
+		if [ "$band" = "2g" ]; then
+			[ -z "$(uci -q get wireless."$sec".channels)" ] && \
+				uci add_list wireless."$sec".channels='1-11'
+			[ -n "$acs_2g_bias" ] && [ -z "$(uci -q get wireless."$sec".acs_chan_bias)" ] && \
+				uci set wireless."$sec".acs_chan_bias="$acs_2g_bias"
+			if ! uci -q show wireless."$sec".hostapd_options | grep -qE "(^|[' ])acs_num_scans="; then
+				uci add_list wireless."$sec".hostapd_options='acs_num_scans=2'
+			fi
+		elif [ "$band" = "5g" ]; then
+			[ -z "$(uci -q get wireless."$sec".acs_exclude_dfs)" ] && \
+				uci set wireless."$sec".acs_exclude_dfs='1'
+			if ! uci -q show wireless."$sec".hostapd_options | grep -qE "(^|[' ])acs_num_scans="; then
+				uci add_list wireless."$sec".hostapd_options='acs_num_scans=1'
+			fi
+			# min_tx_power=15 skips EU 25 mW (13 dBm) channels 149-173; router cap is 22 dBm, PA/RU/UA/BY/KZ/US >= 20 dBm.
+			if ! uci -q show wireless."$sec".hostapd_options | grep -qE "(^|[' ])min_tx_power="; then
+				uci add_list wireless."$sec".hostapd_options='min_tx_power=15'
+			fi
+		fi
+	done
+	uci -q commit wireless
+	touch /etc/config/a5v4
+	uci set a5v4.defaults='defaults'
+	uci set a5v4.defaults.acs='1'
+	uci -q commit a5v4
+fi
+
 [ "$(uci -q get a5v4.defaults.applied)" = "1" ] && exit 0
 
 # Firewall: software flow offloading, the fast path of routing and NAT on this one-core router

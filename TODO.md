@@ -318,19 +318,17 @@ sources*).
 
 ## Open decisions
 
-- **From openwrt-ax3200** (2026-11-19, up to `c6e5cfe469`):
-  - five fixes of `wifi-scripts` from `openwrt-25.12` (Florian Maurer, Felix Fietkau, Harin Lee; `e46e210884`,
-    `4522c07608`, `2ab43560b1`, `a5349c0234`, `29bc851e50`), none of them here yet. One of them sets the antennas only when
-    the configuration changes: the boot log of this router has `radio0: command failed: Not supported (-122)`
-    (`EOPNOTSUPP` on MIPS) from that call. They come with 25.12.7 anyway;
-  - an issue form for GitHub instead of OpenWrt's (which asks to confirm that the report is not about a fork): the
-    description, the release, the model, how it was installed;
-  - a PPPoE session left open by `sysupgrade`: stage2 keeps the network running on devices with more than 32 MB of RAM,
-    netifd kills pppd with `SIGKILL` and no PADT reaches the ISP, which may then refuse the login after the reboot until
-    its own timeout. A fix to try: bring the PPP interfaces down in stage2 before `kill_remaining`.
-
-  Not for this router: the MT7915 fixes, `ax3200-update.sh` (for its releases without a working update page), the
-  `uclient` fix (no `uclient-fetch` here).
+- **sysupgrade leaves the PPPoE session open at the ISP** (found in openwrt-ax3200 on 2026-11-16; the same code here).
+  - **The cause.** `stage2` does not stop `network` on devices with more than 32 MB of RAM (this router has 64 MB), so
+    nothing runs `ifdown`. `kill_remaining TERM` then reaches netifd, and netifd kills its pppd with `SIGKILL`
+    (`netifd_kill_processes()`) before pppd sends its Terminate-Request and PADT. The update page installs through the
+    same `sysupgrade`.
+  - **The effect.** An ISP with one session per login may refuse the login after the reboot (`AUTH_TOPEER_FAILED`)
+    until its own timeout closes the old session. On a lab server the AX3200 sent no PADT, and its new PADI came 52 s
+    later, while the server still held the old session; a `reboot` sends both within 0.075 s (`ifdown -a`).
+  - **The fix to try.** In `stage2`, bring the PPP interfaces down before `kill_remaining`. Check it on the bench with a
+    real `sysupgrade` and a session up, then submit it to OpenWrt: it is an upstream bug. Needs the owner's decision
+    (a change of `base-files`).
 - **A ready `tp_recovery.bin` for the stock firmware** (2026-11-18). The README sends users to the 4pda file
   with OpenWrt 19.07, a build of unknown origin, and then to `sysupgrade -n`. The alternative is an own
   file with this build in every release: one step, no 4pda. It needs TP-Link's second bootloader, which
@@ -500,11 +498,16 @@ Postponed by the owner on 2026-11-07, with PPPoE on the router (the bench covers
 ## Next releases
 
 - **openwrt-ax3200** ([UPGRADING.md appendix D](UPGRADING.md#appendix-d-changes-of-openwrt-ax3200)): checked up to
-  `c6e5cfe469` (2026-11-19); its candidates are under [Open decisions](#open-decisions).
-- **25.12.7 (Linux 6.12.113).** Merge the tag ([UPGRADING.md section 2](UPGRADING.md#2-minor-release-eg-25126--25127)).
-  Drop the six cherry-picks taken ahead of 25.12.7 (`ca-certificates` `4a686570eb`, `musl`
+  `c6e5cfe469` (2026-11-19); what fits this router is taken, the PPPoE finding is under [Open decisions](#open-decisions).
+- **25.12.7 (Linux 6.12.113 or newer; `openwrt-25.12` has 6.12.116 since 2026-11-10).** Merge the tag
+  ([UPGRADING.md section 2](UPGRADING.md#2-minor-release-eg-25126--25127)).
+  Drop the eleven cherry-picks taken ahead of 25.12.7 (`ca-certificates` `4a686570eb`, `musl`
   `1684a761a3`, `dnsmasq` `514fad5218`, `libubox` `6c57f7cd04`, `uhttpd` `5c334c12e2` and
-  `d4cb702258`) and kernel patch `977` (Linux 6.12.113 already has them). Kernel patch `978`
+  `d4cb702258`, `wifi-scripts` `29bc851e50`, `4522c07608`, `e46e210884`, `2ab43560b1` and `a5349c0234`) and kernel patch
+  `977` (Linux 6.12.113 already has them). Kernel patch `978`
   (`pskb_expand_head()`, net-next `c7d8bc3dd511`) stays until the kernel takes it. This build does not use the official kmods, so the kernel version does not have to match a
   release; still, merge release tags, and cherry-pick single fixes of `openwrt-25.12` in between.
   Check the mt76 patches against the new release and the size budget.
+  It also brings ucode of Git HEAD 2026-07-09 with backports (nl80211, ubus) and, with 6.12.114–116, two flowtable fixes
+  ("avoid num_encaps underflow on bridge VLAN untag", "drop existing skb dst before skb_dst_set_noref()"): the bench's
+  offload checks, then the update page (its rpcd plugin is ucode), LuCI and Wi-Fi on the router.

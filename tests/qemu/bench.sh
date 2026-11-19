@@ -772,6 +772,39 @@ ww_daemon_mem() {
                "$(sed -n "s/^VmPTE:[[:space:]]*\([0-9]*\).*/\1/p" /proc/$p/status)"
        done'
 }
+# --- watchcat: off until a rule is added (the build ships an empty /etc/config/watchcat); its LuCI
+# page and the Russian translation are in the image. The rule of the check reboots after 6 h without a
+# reply from 8.8.8.8 (no route there on the bench, but a run is far shorter) and is removed again.
+wc_pid() { r "pgrep -f '^/bin/sh /usr/bin/watchcat.sh '" | head -n 1; }
+wc_mem() {
+    r 'd=$(pgrep -f "^/bin/sh /usr/bin/watchcat.sh " | head -n 1)
+       for p in $d $(grep -l "^PPid:[[:space:]]*$d\$" /proc/[0-9]*/status 2>/dev/null | cut -d/ -f3); do
+           printf "%s %s/%s kB, page tables %s kB; " "$(cat /proc/$p/comm)" \
+               "$(sed -n "s/^RssAnon:[[:space:]]*\([0-9]*\).*/\1/p" /proc/$p/status)" \
+               "$(sed -n "s/^VmRSS:[[:space:]]*\([0-9]*\).*/\1/p" /proc/$p/status)" \
+               "$(sed -n "s/^VmPTE:[[:space:]]*\([0-9]*\).*/\1/p" /proc/$p/status)"
+       done'
+}
+t_watchcat() {
+    [ -z "$(wc_pid)" ] || { echo "watchcat runs without a rule"; r 'ps w | grep watchcat'; return 1; }
+    [ -z "$(r 'uci -q show watchcat')" ] || { echo "watchcat has a rule by default: $(r 'uci -q show watchcat')"; return 1; }
+    r '[ -f /www/luci-static/resources/view/watchcat.js ] && [ -f /usr/share/luci/menu.d/luci-app-watchcat.json ] &&
+       [ -f /usr/share/rpcd/acl.d/luci-app-watchcat.json ] && [ -f /usr/lib/lua/luci/i18n/watchcat.ru.lmo ]' ||
+        { echo "the LuCI page of watchcat or its Russian translation is missing"; return 1; }
+}
+wc_rule_running() { r "pgrep -f '^/bin/sh /usr/bin/watchcat.sh ping_reboot 21600 30 8.8.8.8 '" | grep -q .; }
+t_watchcat_rule() {
+    r 'w=$(uci add watchcat watchcat); uci set watchcat.$w.mode=ping_reboot; uci set watchcat.$w.period=6h
+       uci set watchcat.$w.pinghosts=8.8.8.8; uci set watchcat.$w.forcedelay=30; uci commit watchcat
+       /etc/init.d/watchcat restart' >/dev/null
+    wait_for 10 wc_rule_running ||
+        { echo "watchcat did not start with a rule"; r 'ps w | grep watchcat'; return 1; }
+}
+t_watchcat_rule_off() {
+    r 'uci -q delete watchcat.@watchcat[0]; uci commit watchcat; /etc/init.d/watchcat restart' >/dev/null
+    sleep 2
+    [ -z "$(wc_pid)" ] || { echo "watchcat still runs without a rule"; return 1; }
+}
 t_ww_idle() {
     ww_daemon_idle || { echo "a5v4-wan-watch is not idle"; r "ps w | grep wan-watch"; return 1; }
     ! ww_daemon_watch || { echo "a5v4-wan-watch is polling without a switch"; return 1; }
@@ -1079,6 +1112,14 @@ if r '[ -x /usr/libexec/fwupdate ]'; then
     info "update check at idle: $(r 'cat /tmp/fwupdate/status.json 2>/dev/null || echo "none yet"' | cut -c1-200)"
 else
     skip "update checker at idle" "the image has no luci-app-fwupdate"
+fi
+if r '[ -x /usr/bin/watchcat.sh ]'; then
+    check "watchcat: off without a rule, LuCI page in Russian" t_watchcat
+    check "watchcat: a rule starts it" t_watchcat_rule
+    info "memory of watchcat asleep: $(wc_mem)(private/resident)"
+    check "watchcat: removing the rule stops it" t_watchcat_rule_off
+else
+    skip "watchcat" "the image has no watchcat"
 fi
 if r '[ -x /usr/libexec/a5v4-wan-watch ]'; then
     check "WAN watch at idle: waits without polling when WAN is not on a switch" t_ww_idle

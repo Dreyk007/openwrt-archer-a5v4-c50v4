@@ -60,6 +60,8 @@ The plan decided on 2026-11-01. In this order; every step records its size cost
   every 15 s and restarts the WAN interfaces when link returns after an outage; on by default, off
   with `a5v4.network.wan_watch='0'`; checked in the QEMU bench and on the router (2026-11-19: a boot,
   a network reload and the WAN port off for 60 s).
+- watchcat with its LuCI page in Russian (2026-11-19, [RESEARCH.md section 10](RESEARCH.md#10-what-the-image-leaves-out)):
+  off until a rule is added, through an empty `/etc/config/watchcat`.
 
 1. **The router.** A full dump of all partitions before the first flash (`radio` and `rom` are
     unique to the unit), then `sysupgrade` (`-f` with a configuration tested in QEMU keeps the
@@ -134,6 +136,8 @@ sources*).
 - **Firmware updates from LuCI:** the checker at idle; with a test server, the check, the notice of
   the Overview page, the download (size, SHA256, the memory check) and no connection *(bench)*. A
   malta image cannot be validated (`sysupgrade -T`): the router does that.
+- **watchcat:** off without a rule, its LuCI page and the Russian translation; a rule starts it, and its
+  removal stops it *(bench)*.
 - **WAN link watch:** idle without polling when WAN is not on a switch; with a synthetic link file,
   no restart while up, DHCP recovery on a new range with `wan6` restart and syslog line, disabled
   option and control case leaving the stale lease, PPPoE and L2TP recovery *(bench)*.

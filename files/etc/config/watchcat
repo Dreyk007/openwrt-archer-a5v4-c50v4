@@ -1,0 +1,2 @@
+# Watchcat is off in this build until a rule is added in LuCI (Services -> Watchcat): a reboot or an
+# interface restart after a period without a ping reply, or a periodic reboot.

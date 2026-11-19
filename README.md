@@ -532,6 +532,8 @@ The router then asks the ISP's DNS again. Other DoH providers are set on the sam
   * `travelmate` with its LuCI page;
   * `iw` and `iwinfo`.
 * **The internet connection:** PPPoE, L2TP (`xl2tpd`), and IPv6 (`odhcp6c`, `odhcpd`).
+* **Watchdog:** `watchcat` with its LuCI page. It does nothing until a rule is added in *Services → Watchcat*: a reboot or a
+  restart of an interface when pings fail for a set time, or a reboot on a schedule.
 * **Tools:** `curl`, and the busybox tools (`ip`, `ping`, `traceroute`, `nslookup`, `top`, `vi` and others).
 
 ---

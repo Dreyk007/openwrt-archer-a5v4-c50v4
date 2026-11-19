@@ -9,7 +9,7 @@ Before an update, read [TODO.md](TODO.md): it lists the fork's patches to drop o
 
 Unlike the AX3200 build this one does not use the official package repository or its kernel modules, so there is no vermagic to follow and no kernel configuration parity to keep. Instead, every update has to keep the kernel configuration of this build intact ([2.5](#25-build-and-check-the-kernel-configuration)), pass the QEMU bench and fit the flash and RAM budget ([Appendix B](#appendix-b-flash-and-ram-budget-check)).
 
-**Contents:** [1. What the branch consists of](#1-what-the-branch-consists-of) · [2. Minor release](#2-minor-release-eg-25126--25127) · [3. Major release](#3-major-release-eg-2512--26xx) · [Appendix A](#appendix-a-simulating-a-merge-without-touching-the-working-tree) · [Appendix B](#appendix-b-flash-and-ram-budget-check) · [Appendix C](#appendix-c-on-device-verification)
+**Contents:** [1. What the branch consists of](#1-what-the-branch-consists-of) · [2. Minor release](#2-minor-release-eg-25126--25127) · [3. Major release](#3-major-release-eg-2512--26xx) · [Appendix A](#appendix-a-simulating-a-merge-without-touching-the-working-tree) · [Appendix B](#appendix-b-flash-and-ram-budget-check) · [Appendix C](#appendix-c-on-device-verification) · [Appendix D](#appendix-d-changes-of-openwrt-ax3200)
 
 ---
 
@@ -139,6 +139,8 @@ Expected effort: **few conflicts**, at the edits of 1.1 and 1.2. A simulation on
 
 Below, `NEW=25.12.7` and `OLD=25.12.6`.
 
+Before the merge, look at what openwrt-ax3200 has taken since the last check ([appendix D](#appendix-d-changes-of-openwrt-ax3200)): fixes of `openwrt-25.12` that it cherry-picked may still be missing here.
+
 ### 2.1. Preview the merge (does not change anything)
 
 ```bash
@@ -266,6 +268,8 @@ git switch -c a5v4-26.xx v26.xx.0
 OLDBASE=v25.12.6
 git log --reverse --no-merges --format='%h %an | %s' $OLDBASE..a5v4-25.12
 ```
+
+Look at openwrt-ax3200 too ([appendix D](#appendix-d-changes-of-openwrt-ax3200)): it may already run on the new series with fixes this build needs.
 
 ### 3.4. Port this build's commits
 
@@ -417,3 +421,22 @@ logread | grep -iE 'error|fail' | tail -20
 ```
 
 While a connection runs through the router, `conntrack` entries with the `[OFFLOAD]` flag in `/proc/net/nf_conntrack` confirm that software flow offloading is active; check it for a wired client, a Wi-Fi client after `wifi reload`, the PPPoE WAN, WireGuard and the WISP client.
+
+---
+
+## Appendix D: Changes of openwrt-ax3200
+
+[openwrt-ax3200](https://github.com/Dreyk007/openwrt-ax3200), the sibling build this one follows, often takes fixes first: cherry-picks of `openwrt-25.12`, fixes of packages both images carry (`uhttpd`, `libubox`, `wifi-scripts`, `https-dns-proxy`, `curl`), its own scripts and documents, and files of GitHub. Look at its commits at every update to a new OpenWrt release (sections 2 and 3), and before each release of this build.
+
+```bash
+git clone https://github.com/Dreyk007/openwrt-ax3200.git ../openwrt-ax3200   # once; later: git -C ../openwrt-ax3200 fetch
+LAST=c6e5cfe469   # the last commit checked, from TODO.md ("Next releases")
+git -C ../openwrt-ax3200 log --reverse --format='%h %ad %an | %s' --date=short $LAST..origin/xq-25.12
+```
+
+For each commit:
+* **Not for this router:** MT7915, MT7622, the PPE and WED (HFO), UBI and the flash layout of the AX3200, the package manager and the restore of packages, `uclient-fetch` (not in this image).
+* **A cherry-pick of `openwrt-25.12`** for a package of this image: check that the change is not here yet (`git -C ../openwrt-ax3200 show <commit> | git apply --check`), then take the upstream commit with its author: `git cherry-pick -x <hash in openwrt-25.12>` (its message names it). It joins the cherry-picks to drop with the next minor release ([TODO.md](TODO.md#next-releases)).
+* **Its own fixes, features and documents:** what fits this router goes to the owner as a candidate, with its cost; the contents of the image change only with the owner's approval ([AGENTS.md](AGENTS.md#rules)).
+
+Then write the last commit checked and the candidates into [TODO.md](TODO.md#next-releases).

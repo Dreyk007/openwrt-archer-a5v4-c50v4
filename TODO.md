@@ -318,6 +318,19 @@ sources*).
 
 ## Open decisions
 
+- **From openwrt-ax3200** (2026-11-19, up to `c6e5cfe469`):
+  - five fixes of `wifi-scripts` from `openwrt-25.12` (Florian Maurer, Felix Fietkau, Harin Lee; `e46e210884`,
+    `4522c07608`, `2ab43560b1`, `a5349c0234`, `29bc851e50`), none of them here yet. One of them sets the antennas only when
+    the configuration changes: the boot log of this router has `radio0: command failed: Not supported (-122)`
+    (`EOPNOTSUPP` on MIPS) from that call. They come with 25.12.7 anyway;
+  - an issue form for GitHub instead of OpenWrt's (which asks to confirm that the report is not about a fork): the
+    description, the release, the model, how it was installed;
+  - a PPPoE session left open by `sysupgrade`: stage2 keeps the network running on devices with more than 32 MB of RAM,
+    netifd kills pppd with `SIGKILL` and no PADT reaches the ISP, which may then refuse the login after the reboot until
+    its own timeout. A fix to try: bring the PPP interfaces down in stage2 before `kill_remaining`.
+
+  Not for this router: the MT7915 fixes, `ax3200-update.sh` (for its releases without a working update page), the
+  `uclient` fix (no `uclient-fetch` here).
 - **A ready `tp_recovery.bin` for the stock firmware** (2026-11-18). The README sends users to the 4pda file
   with OpenWrt 19.07, a build of unknown origin, and then to `sysupgrade -n`. The alternative is an own
   file with this build in every release: one step, no 4pda. It needs TP-Link's second bootloader, which
@@ -486,6 +499,8 @@ Postponed by the owner on 2026-11-07, with PPPoE on the router (the bench covers
 
 ## Next releases
 
+- **openwrt-ax3200** ([UPGRADING.md appendix D](UPGRADING.md#appendix-d-changes-of-openwrt-ax3200)): checked up to
+  `c6e5cfe469` (2026-11-19); its candidates are under [Open decisions](#open-decisions).
 - **25.12.7 (Linux 6.12.113).** Merge the tag ([UPGRADING.md section 2](UPGRADING.md#2-minor-release-eg-25126--25127)).
   Drop the six cherry-picks taken ahead of 25.12.7 (`ca-certificates` `4a686570eb`, `musl`
   `1684a761a3`, `dnsmasq` `514fad5218`, `libubox` `6c57f7cd04`, `uhttpd` `5c334c12e2` and

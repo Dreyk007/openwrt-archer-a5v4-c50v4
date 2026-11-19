@@ -6,9 +6,6 @@
 
 [![Скачать последний релиз](https://img.shields.io/github/v/release/Dreyk007/openwrt-archer-a5v4-c50v4?style=for-the-badge&label=%D0%A1%D0%BA%D0%B0%D1%87%D0%B0%D1%82%D1%8C&color=2ea44f)](https://github.com/Dreyk007/openwrt-archer-a5v4-c50v4/releases/latest) [![Установка](https://img.shields.io/badge/%D0%A3%D1%81%D1%82%D0%B0%D0%BD%D0%BE%D0%B2%D0%BA%D0%B0-0969da?style=for-the-badge)](#установка)
 
-> [!NOTE]
-> Первый релиз готовится. Пока он не опубликован, ссылки на скачивание на этой странице не работают.
-
 **Какой файл скачать:** файл прошивки один —
 `openwrt-ramips-mt76x8-tplink_archer-c50-v4-squashfs-sysupgrade.bin`.
 * **С OpenWrt** он ставится как есть.

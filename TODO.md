@@ -68,7 +68,6 @@ The plan decided on 2026-11-01. In this order; every step records its size cost
     remote access), then the checks below.
 2. **Release.**
     - `README.md` and `README.ru.md` are written (2026-11-17). At the release:
-      - remove the note that the first release is being prepared (the download links work then);
       - section A (2026-11-18) goes through the 4pda recovery file with OpenWrt 19.07, the way the
         owner checked, and then this build as in section B; the recipe of an own file with this
         build follows under a spoiler. Repeat both when there is physical access

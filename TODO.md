@@ -55,6 +55,11 @@ The plan decided on 2026-11-01. In this order; every step records its size cost
   [RESEARCH.md section 17](RESEARCH.md#17-firmware-updates-from-luci)): the check of the GitHub
   releases, the notice on the Overview page and the update with one button, with the release
   information that `build.sh` writes and the release workflow publishes.
+- WAN link watch (`files/etc/init.d/a5v4-wan-watch`, `files/usr/libexec/a5v4-wan-watch`, decided on
+  2026-11-19, [RESEARCH.md section 18](RESEARCH.md#18-wan-link-watch)): polls the WAN switch port
+  every 15 s and restarts the WAN interfaces when link returns after an outage; on by default, off
+  with `a5v4.network.wan_watch='0'`; checked in the QEMU bench and on the router (2026-11-19: a boot,
+  a network reload and the WAN port off for 60 s).
 
 1. **The router.** A full dump of all partitions before the first flash (`radio` and `rom` are
     unique to the unit), then `sysupgrade` (`-f` with a configuration tested in QEMU keeps the
@@ -129,6 +134,9 @@ sources*).
 - **Firmware updates from LuCI:** the checker at idle; with a test server, the check, the notice of
   the Overview page, the download (size, SHA256, the memory check) and no connection *(bench)*. A
   malta image cannot be validated (`sysupgrade -T`): the router does that.
+- **WAN link watch:** idle without polling when WAN is not on a switch; with a synthetic link file,
+  no restart while up, DHCP recovery on a new range with `wan6` restart and syslog line, disabled
+  option and control case leaving the stale lease, PPPoE and L2TP recovery *(bench)*.
 - **First boot:** `/etc/uci-defaults` is empty afterwards, the defaults are set *(bench)*; they apply once
   (marker; test with a sysupgrade that keeps settings); without
   `urngd` the time to `crng init done` and to the dropbear host keys stays short.
@@ -274,6 +282,9 @@ sources*).
   24.7 Mbit/s); AmneziaWG on a release image, since the debug image leaves it out.
 - **L2TP on the WAN:** check against a real ISP LNS (a user's report — throughput, reconnects,
   PPPoL2TP kernel forwarding and flow offloading).
+- **WAN link watch** ([RESEARCH.md section 18](RESEARCH.md#18-wan-link-watch)): checked on
+  2026-11-19 with the WAN port turned off from the router for 60 s; a real cable re-plug at the
+  site is still untested.
 - **Boot time** ([RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router)): the boot is bound by
   reading the flash, and odhcpd adds about 30 MiB of reads while the radios are set up. Candidates,
   each to be measured with the same reboots (`/proc/diskstats` of `mtdblock4`, WAN and AP times):
@@ -406,6 +417,10 @@ Each patch the fork carries gets an item here: what it waits for, and when to dr
   adapt the remaining patches and `tx_opt` bits around what was merged.
 - **GCC 15.3.0** (three commits of OpenWrt main, [UPGRADING.md section 1.1](UPGRADING.md#11-this-builds-commits)):
   drop them once the series builds 15.3.0 or newer by default.
+- **WAN link watch** (`files/etc/init.d/a5v4-wan-watch`, `files/usr/libexec/a5v4-wan-watch`,
+  [RESEARCH.md section 18](RESEARCH.md#18-wan-link-watch)): drop the service when OpenWrt moves
+  `mt76x8` to DSA (mainline `drivers/net/dsa/mt7628.c`), which gives each switch port its own
+  netdev and carrier.
 
 ## Deferred
 

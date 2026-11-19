@@ -2,7 +2,7 @@
 
 The measurements, source checks and decisions behind this build. Until 2026-11-02 nothing had run on a router: the sizes come from test builds, everything else from the sources; [section 12](#12-tests-on-the-router) has the tests on the router since. Each section ends with its decision; decisions taken after the research carry their date. What is still to be measured or checked is listed in [TODO.md](TODO.md#checks-and-measurements).
 
-**Contents:** [Method and sources](#method-and-sources) · [1. Hardware](#1-hardware-flash-layout-and-installation) · [2. Programs](#2-size-of-the-programs) · [3. Kernel](#3-size-of-the-kernel) · [4. IPv6](#4-ipv6) · [5. Compiler](#5-compiler-and-flags) · [6. mt76 fixes](#6-wi-fi-driver-fixes-from-mt76-master) · [7. WISP](#7-wi-fi-client-and-access-point-wisp) · [8. Routing, acceleration, IPTV](#8-routing-acceleration-and-iptv) · [9. Hardening](#9-kernel-hardening) · [10. What the image leaves out](#10-what-the-image-leaves-out) · [11. zram](#11-zram) · [12. Router tests](#12-tests-on-the-router) · [13. VPN](#13-vpn-wireguard-and-amneziawg) · [14. DoH](#14-encrypted-dns-doh) · [15. The 4pda thread](#15-the-4pda-thread) · [16. The OpenWrt forum](#16-the-openwrt-forum) · [17. Firmware updates](#17-firmware-updates-from-luci) · [Sources](#sources)
+**Contents:** [Method and sources](#method-and-sources) · [1. Hardware](#1-hardware-flash-layout-and-installation) · [2. Programs](#2-size-of-the-programs) · [3. Kernel](#3-size-of-the-kernel) · [4. IPv6](#4-ipv6) · [5. Compiler](#5-compiler-and-flags) · [6. mt76 fixes](#6-wi-fi-driver-fixes-from-mt76-master) · [7. WISP](#7-wi-fi-client-and-access-point-wisp) · [8. Routing, acceleration, IPTV](#8-routing-acceleration-and-iptv) · [9. Hardening](#9-kernel-hardening) · [10. What the image leaves out](#10-what-the-image-leaves-out) · [11. zram](#11-zram) · [12. Router tests](#12-tests-on-the-router) · [13. VPN](#13-vpn-wireguard-and-amneziawg) · [14. DoH](#14-encrypted-dns-doh) · [15. The 4pda thread](#15-the-4pda-thread) · [16. The OpenWrt forum](#16-the-openwrt-forum) · [17. Firmware updates](#17-firmware-updates-from-luci) · [18. WAN link watch](#18-wan-link-watch) · [Sources](#sources)
 
 ## Method and sources
 
@@ -1039,6 +1039,43 @@ through the calls of the page's buttons over LuCI's `/ubus`):
 | LuCI right after a drop (`luci-bench.sh`, 5 rounds, the first one cold) | the first Overview HTML 3.8 s (then 0.19 s), the first Overview batch 2.5 s (then 1.07 s), `luci.js` 0.21 s (then 9 ms), the login page and the Wireless batch unchanged: the router reads its files from the flash again once |
 
 **Decision (2026-11-17):** as above. The checker stays (0.14 MB, below the bar of 0.3 MB of the task's brief). The margin of `MemAvailable` is 6 MiB, read after a drop of the page cache (`1`) and a wait of up to 60 s for the freed pages. The release goes into the firmware version (the owner, 2026-11-17).
+
+## 18. WAN link watch
+
+**The problem.** After two outages of the ISP's equipment (2026-11-06 and 2026-11-17), the router did not regain internet access once the line came back; only a manual reboot (or `ifup wan`) restored it.
+
+**Cause in the switch driver.** In `target/linux/ramips/files/drivers/net/ethernet/ralink/esw_rt3050.c`, `esw_interrupt()` calls `rt3050_esw_has_carrier()`, which reads `RT305X_ESW_REG_POA`, logs `port %d link up/down` for individual ports, and returns `!!link && cpuport` — true whenever **any** external switch port (0–4) has link and CPU port 6 is up. That drives the carrier of `eth0`, and both `eth0.1` (LAN) and `eth0.2` (WAN) inherit `eth0`'s carrier. While any device is plugged into a LAN port, a link loss on the WAN port (port 0) changes no carrier. `netifd` and `udhcpc` never learn that the line went down and came back, so `udhcpc` keeps the old DHCP lease until its next renewal. PPPoE recovers on its own (`ppp.sh` defaults to `keepalive "5 1"`), whereas DHCP and L2TP over a DHCP WAN do not.
+
+**Measurements on the router** (read-only, 2026-11-17 and 2026-11-19, `v25.12.5-a5v4-r2`):
+
+| | Result |
+|---|---|
+| `/sys/class/net/eth0.2/carrier_changes` | **0** after 31 h uptime (`eth0`: 5 during boot and switch resets) |
+| ISP DHCP lease and renewals | 21,600 s lease, renewed every 3 h (T1); renewals at 19:14 and 23:14 UTC on 2026-11-18 went unanswered, the retry at 20:44 received 17,999 s — recovery after an outage takes up to ~5 h until an answered renewal or rebind |
+| `swconfig dev switch0 port 0 get link` | prints `port:0 link:up speed:100baseT full-duplex` (reads `RT305X_ESW_REG_POA` in `esw_get_port_link()`) |
+| Cost of one poll | 50 calls in 0.66 s (**13.2 ms/poll**), 100 calls in 1.30 s (**13.0 ms/poll**) → **~0.09 % CPU** at a 15 s interval |
+| Daemon RAM (measured from `/tmp` on the router and on the QEMU bench) | `a5v4-wan-watch` (`sh`) 68 kB private (`RssAnon`), 1240 kB resident (`VmRSS`), 20 kB page tables; `sleep` 44 kB private, 1028 kB resident, 16 kB page tables; plus two 8 KiB kernel stacks ≈ **0.16 MB** (bar: 0.3 MB) |
+| Flash cost (against `a5v4-25.12`) | two scripts 8,504 B unpacked (~3.0 KiB xz-compressed); `root.squashfs` 4,571,998 → 4,575,114 B (4465 → 4468 KiB, **+3,116 B / +3.0 KiB**; bar: 4 KiB); image stays **6401 KiB** (1215 KiB free for settings) |
+
+**Design** (`files/etc/init.d/a5v4-wan-watch`, `files/usr/libexec/a5v4-wan-watch`):
+
+* **On by default** (`START=99`, procd with `respawn` and reload triggers on `network` and `a5v4`). Turned off with `a5v4.network.wan_watch='0'` and `/etc/init.d/a5v4-wan-watch reload`.
+* **Configuration-driven port detection:** resolves `network.wan`'s device (`eth0.<N>`), verifies the base interface is the switch's CPU interface in `/etc/board.json` (and reads its CPU port), finds the `switch_vlan` matching that VLAN (`vid` if set, else `vlan`) and takes its untagged non-CPU port(s), and collects all enabled netifd interfaces on the WAN device (`wan`, `wan6`, …). The init script passes the resolved switch, ports and interfaces as arguments so procd restarts the daemon only when the WAN configuration changes. When `wan` is not on a switch VLAN (e.g. a Wi-Fi uplink with travelmate, or no `wan`), the service stays running in `idle` mode without polling.
+* **Poll and action:** polls `swconfig dev <sw> port <p> get link` every **15 s** (each steady-state poll forks only `swconfig` and `sleep`). Starts after `S20network` configures the switch and takes the first poll as the baseline, so booting causes no restart. When a port that was down comes back up, logs one line with `logger` (the port and how many polls it was down) and calls `ifup` once on each WAN interface. L2TP over a DHCP WAN comes back by itself through netifd's host dependency (`proto_add_host_dependency` in `l2tp.sh` tears down L2TP on `wan` down and brings it up again once `wan` gets its new address).
+* **Switch reset on `network reload`:** `/etc/init.d/network reload` resets `switch0`, and the fork's WAN isolation holds port 0 down for ~1.6–2 s until the VLANs are applied (`dmesg`: 50.54 → 52.18 s). When a poll sees a new `up → down` transition (and the interval is at least 10 s), the daemon confirms the down state after 5 s before recording it, avoiding false restarts if a poll lands inside a switch reset.
+* **Short drops:** a link drop shorter than 15 s (or shorter than the 5 s confirmation window) can pass unseen. That is acceptable: ISP equipment power cuts and cable re-plugs last longer than a few seconds.
+* **Test-only options** (for the QEMU bench, where malta has no switch): `a5v4.network.wan_watch_link_file` (replaces `swconfig` with a file holding `<port> up|down`) and `a5v4.network.wan_watch_interval`.
+
+**State of DSA.** This is a known limitation of `swconfig` with one CPU port for all switch ports. Mainline Linux 7.3 has a DSA driver for this switch (`drivers/net/dsa/mt7628.c`), giving each port its own netdev and carrier, but OpenWrt has not moved `mt76x8` to DSA yet. This service is a stopgap until OpenWrt migrates `mt76x8` to DSA.
+
+**On the QEMU bench** *(bench)*: 10 checks — idle without polling when WAN is not on a switch; with a 10 s interval (5 s confirmation active), 3 s short drops across all phases of the cycle do not restart while a drop over two polls restarts once; with a 3 s interval, no restart over several polls while link is up, DHCP recovery to a new range with `wan6` restart and syslog entry when the WAN DHCP server restarts with an empty lease file, disabled option stopping the daemon, control case leaving the stale lease when disabled, PPPoE recovery after a link flap, L2TP over DHCP WAN recovery across a DHCP range change, and restoration to idle.
+
+**On the router** (2026-11-19, the image `v25.12.5-a5v4-r3`, flashed with the settings kept):
+* **Idle:** the service watches port 0 with `wan` and `wan6`, and restarted nothing at boot. In `watch` mode it takes about 0.17 MB of RAM (72 + 44 kB private, 20 + 20 kB page tables, two kernel stacks); a poll takes 13.1 ms.
+* **`/etc/init.d/network reload`:** port 0 was down for 1.67 s during the switch reset; no restart.
+* **Port 0 off for 60 s** (`swconfig dev switch0 port 0 set disable 1`, `apply`, then `disable 0`, `apply`): for the whole minute `eth0.2` kept its carrier, `wan` its old address and `udhcpc` its PID, which confirms the cause. The link came back 2 s after the port was enabled; 12 s later the service logged `port 0 up after 4 polls down` and restarted `wan` and `wan6`, and `wan` was up with a new lease 15 s after the link returned. The VLANs and the LAN ports stayed as they were. The ISP gave the new lease 1800 s (its renewals give 21,600 s).
+
+**Decision (2026-11-19):** poll the WAN switch port every 15 s and restart the WAN interfaces when it comes back up after being down; on by default, off with `a5v4.network.wan_watch='0'`. No kernel patch, no DSA backport, no ping watchdog.
 
 ## Sources
 

@@ -72,6 +72,8 @@ Archer A5 v4** (also v4.2 and v4.20) **and Archer C50 v4**, one device with one 
   * security fixes ahead of OpenWrt 25.12.7.
 * **No LAN traffic leaks through the WAN port while the router boots.** OpenWrt has this fault on this switch
   ([section 5](#5-network-stack)).
+* **Recovery after an ISP outage:** when the link on the WAN port comes back, the router asks for a new address within 15 s
+  ([Internet connection](#internet-connection)).
 * **Your settings survive updates:** the defaults of the build are applied once per configuration
   ([section 8](#8-how-the-defaults-are-applied)).
 * **Updates from LuCI:** the router finds new releases of this build on GitHub, shows a notice on the Overview page and
@@ -461,6 +463,15 @@ newer.
   way. This was tested in emulation.
 * **The MAC address of the WAN**, for ISPs that bind a contract to one: *Network → Interfaces* → *Devices* → `eth0.2` →
   *Configure…* → *MAC address*.
+* **After an ISP outage:** the router checks the link on the WAN port every 15 s and, when it comes back, restarts the WAN
+  connection to get a new address right away.\
+  If needed, this behaviour can be turned off like this:
+  ```sh
+  uci set a5v4.network=network
+  uci set a5v4.network.wan_watch='0'
+  uci commit a5v4
+  /etc/init.d/a5v4-wan-watch reload
+  ```
 
 ### Internet over Wi-Fi (WISP)
 travelmate connects the router to another Wi-Fi network as its internet: a hotel, a neighbour's router or a phone's hotspot.

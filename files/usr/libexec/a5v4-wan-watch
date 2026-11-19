@@ -1,0 +1,263 @@
+#!/bin/sh
+#
+# Watch the WAN switch port(s) and restart every netifd interface on the WAN device when a port
+# comes back up after being down (RESEARCH.md section 18).
+#
+# Modes:
+#   detect [link_file]
+#       Print "<switch>|<ports>|<ifaces>" from /etc/config/network, or nothing if WAN is not on
+#       a switch VLAN and no link_file is given. Read-only; safe for dry-run checks.
+#   watch <switch> <ports> <ifaces> [interval] [link_file]
+#       Poll each port every <interval> s (default 15) and call ifup on every interface in
+#       <ifaces> once when a port comes back up after being down.
+#   idle
+#       Wait without polling until terminated (when WAN is not on a switch VLAN).
+#
+# Test-only options (for the QEMU bench, set via /etc/config/a5v4):
+#   a5v4.network.wan_watch_link_file - path to a file with "<port> up|down" lines instead of
+#       querying swconfig; overrides switch/VLAN detection so a board without a switch can test.
+#   a5v4.network.wan_watch_interval  - poll interval in seconds (default 15).
+
+PAUSE=""
+
+pause() {
+	sleep "$1" &
+	PAUSE=$!
+	wait "$PAUSE"
+	PAUSE=""
+}
+
+trap '[ -n "$PAUSE" ] && kill "$PAUSE" 2>/dev/null; exit 0' TERM INT
+
+do_detect() {
+	local link_file="$1"
+	local wan_dev wan_disabled cpu_dev wan_vid wan_switch cpu_port wan_ports wan_ifaces
+
+	. /lib/functions.sh
+	config_load network
+
+	config_get wan_dev wan device
+	[ -n "$wan_dev" ] || config_get wan_dev wan ifname
+	config_get_bool wan_disabled wan disabled 0
+	[ "$wan_disabled" = 0 ] && [ -n "$wan_dev" ] || return 0
+
+	# Collect every enabled netifd interface on the WAN device
+	wan_ifaces=""
+	_add_iface() {
+		local sec="$1" dev dis
+		config_get dev "$sec" device
+		[ -n "$dev" ] || config_get dev "$sec" ifname
+		config_get_bool dis "$sec" disabled 0
+		[ "$dis" = 0 ] && [ "$dev" = "$wan_dev" ] || return 0
+		wan_ifaces="${wan_ifaces:+$wan_ifaces }$sec"
+	}
+	config_foreach _add_iface interface
+	[ -n "$wan_ifaces" ] || return 0
+
+	# Test-only: read the port list from the synthetic link file
+	if [ -n "$link_file" ]; then
+		local tok rest p
+		wan_ports=""
+		if [ -r "$link_file" ]; then
+			while read -r tok rest || [ -n "$tok" ]; do
+				p=${tok#port:}
+				case "$p" in
+					''|*[!0-9]*) continue ;;
+				esac
+				case " $wan_ports " in
+					*" $p "*) ;;
+					*) wan_ports="${wan_ports:+$wan_ports }$p" ;;
+				esac
+			done < "$link_file"
+		fi
+		[ -n "$wan_ports" ] && printf '%s|%s|%s\n' "-" "$wan_ports" "$wan_ifaces"
+		return 0
+	fi
+
+	# WAN device must be a VLAN of a switch CPU interface (<dev>.<vid>)
+	case "$wan_dev" in
+		*.*)
+			cpu_dev=${wan_dev%.*}
+			wan_vid=${wan_dev##*.}
+			;;
+		*)
+			return 0
+			;;
+	esac
+	case "$wan_vid" in
+		''|*[!0-9]*) return 0 ;;
+	esac
+
+	# Find the VLAN-enabled switch whose CPU interface is $cpu_dev
+	wan_switch=""
+	cpu_port=""
+	_find_switch() {
+		local sec="$1" sw en cp
+		[ -z "$wan_switch" ] || return 0
+		config_get sw "$sec" name "$sec"
+		config_get_bool en "$sec" enable_vlan 0
+		[ "$en" = 1 ] || return 0
+
+		if [ -r /etc/board.json ]; then
+			cp=$(jsonfilter -i /etc/board.json \
+				-e "@.switch.$sw.ports[@.device=\"$cpu_dev\"].num" 2>/dev/null | head -n 1)
+			[ -n "$cp" ] || return 0
+		else
+			cp=$(swconfig dev "$sw" help 2>/dev/null | sed -n 's/.*(cpu @ \([0-9]*\)).*/\1/p' | head -n 1)
+			[ -n "$cp" ] || return 0
+		fi
+		wan_switch="$sw"
+		cpu_port="$cp"
+	}
+	config_foreach _find_switch switch
+	[ -n "$wan_switch" ] || return 0
+
+	# Find the switch_vlan matching $wan_vid (vid if set, else vlan) and take its
+	# untagged ports other than the CPU port
+	wan_ports=""
+	_find_vlan_ports() {
+		local sec="$1" s_dev s_vlan s_vid s_ports tok p
+		config_get s_dev "$sec" device
+		[ "$s_dev" = "$wan_switch" ] || return 0
+		config_get s_vlan "$sec" vlan
+		config_get s_vid "$sec" vid
+		[ "${s_vid:-$s_vlan}" = "$wan_vid" ] || return 0
+		config_get s_ports "$sec" ports
+		for tok in $s_ports; do
+			case "$tok" in
+				*t) continue ;;
+			esac
+			p=${tok%u}
+			case "$p" in
+				''|*[!0-9]*) continue ;;
+			esac
+			[ "$p" = "$cpu_port" ] && continue
+			case " $wan_ports " in
+				*" $p "*) ;;
+				*) wan_ports="${wan_ports:+$wan_ports }$p" ;;
+			esac
+		done
+	}
+	config_foreach _find_vlan_ports switch_vlan
+	[ -n "$wan_ports" ] || return 0
+
+	printf '%s|%s|%s\n' "$wan_switch" "$wan_ports" "$wan_ifaces"
+}
+
+port_up() {
+	local p="$1" line
+	if [ -n "$link_file" ]; then
+		while IFS= read -r line || [ -n "$line" ]; do
+			case " $line " in
+				*" $p up "*|*" port:$p link:up "*) return 0 ;;
+			esac
+		done < "$link_file" 2>/dev/null
+		return 1
+	fi
+	case "$(swconfig dev "$switch" port "$p" get link 2>/dev/null)" in
+		*link:up*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+do_idle() {
+	while :; do
+		pause 86400
+	done
+}
+
+do_watch() {
+	local switch="$1" ports="$2" ifaces="$3" interval="${4:-15}" link_file="$5"
+	local confirm=0 p d newly_down up_msg restart wait_s iface
+
+	case "$interval" in
+		''|*[!0-9]*|0) interval=15 ;;
+	esac
+	# Confirm a new down reading after 5 s so a ~2 s switch reset during network reload
+	# does not cause a false restart (only when the poll interval is at least 10 s).
+	[ "$interval" -ge 10 ] && confirm=5
+
+	# Initial poll: take the current state as the baseline (no restart at startup).
+	newly_down=""
+	for p in $ports; do
+		eval "down_$p=0"
+		if ! port_up "$p"; then
+			newly_down="${newly_down:+$newly_down }$p"
+		fi
+	done
+	if [ -n "$newly_down" ]; then
+		if [ "$confirm" -gt 0 ]; then
+			pause "$confirm"
+			for p in $newly_down; do
+				port_up "$p" || eval "down_$p=1"
+			done
+		else
+			for p in $newly_down; do
+				eval "down_$p=1"
+			done
+		fi
+	fi
+
+	wait_s=$interval
+	while :; do
+		pause "$wait_s"
+		wait_s=$interval
+		newly_down=""
+		up_msg=""
+		restart=0
+
+		for p in $ports; do
+			eval "d=\$down_$p"
+			if port_up "$p"; then
+				if [ "$d" -gt 0 ]; then
+					eval "down_$p=0"
+					restart=1
+					if [ "$d" -eq 1 ]; then
+						up_msg="${up_msg:+$up_msg; }port $p up after 1 poll down"
+					else
+						up_msg="${up_msg:+$up_msg; }port $p up after $d polls down"
+					fi
+				fi
+			else
+				if [ "$d" -eq 0 ] && [ "$confirm" -gt 0 ]; then
+					newly_down="${newly_down:+$newly_down }$p"
+				else
+					eval "down_$p=$((d + 1))"
+				fi
+			fi
+		done
+
+		if [ "$restart" -eq 1 ]; then
+			logger -t a5v4-wan-watch "$up_msg, restarting: $ifaces"
+			for iface in $ifaces; do
+				ifup "$iface" >/dev/null 2>&1
+			done
+		fi
+
+		if [ -n "$newly_down" ]; then
+			pause "$confirm"
+			for p in $newly_down; do
+				port_up "$p" || eval "down_$p=1"
+			done
+			wait_s=$((interval - confirm))
+		fi
+	done
+}
+
+case "$1" in
+	detect)
+		shift
+		do_detect "$@"
+		;;
+	watch)
+		shift
+		do_watch "$@"
+		;;
+	idle)
+		do_idle
+		;;
+	*)
+		echo "Usage: $0 detect [link_file] | watch <switch> <ports> <ifaces> [interval] [link_file] | idle" >&2
+		exit 1
+		;;
+esac

@@ -145,10 +145,19 @@ nsx lan ip route add default via 192.168.1.1
 # WAN side: the ISP (DHCP and DNS) and a host "on the internet" behind it
 nsx wan ip addr add 192.0.2.1/24 dev eth0
 nsx wan ip addr add 198.18.0.1/32 dev lo
-nsx wan dnsmasq --no-resolv --no-hosts --interface=eth0 --bind-interfaces --listen-address=192.0.2.1 \
-    --dhcp-range=192.0.2.100,192.0.2.150,255.255.255.0,1h \
-    --dhcp-option=option:router,192.0.2.1 --dhcp-option=option:dns-server,192.0.2.1 \
-    --address=/openwrt-bench.net/198.18.0.1 --local=/#/ --dhcp-leasefile="$W/wan.leases" --pid-file="$W/dnsmasq-wan.pid"
+wan_dnsmasq_start() {
+    local lo="$1" hi="$2"
+    if [ -f "$W/dnsmasq-wan.pid" ]; then
+        kill "$(cat "$W/dnsmasq-wan.pid")" 2>/dev/null || true
+        sleep 0.5
+    fi
+    rm -f "$W/wan.leases" "$W/dnsmasq-wan.pid"
+    nsx wan dnsmasq --no-resolv --no-hosts --interface=eth0 --bind-interfaces --listen-address=192.0.2.1 \
+        --dhcp-range="$lo,$hi,255.255.255.0,1h" \
+        --dhcp-option=option:router,192.0.2.1 --dhcp-option=option:dns-server,192.0.2.1 \
+        --address=/openwrt-bench.net/198.18.0.1 --local=/#/ --dhcp-leasefile="$W/wan.leases" --pid-file="$W/dnsmasq-wan.pid"
+}
+wan_dnsmasq_start 192.0.2.100 192.0.2.150
 nsx wan iperf3 -s -D -B 198.18.0.1 --pidfile "$W/iperf3.pid"
 
 # PPPoE server of the ISP (pppd needs /dev/ppp, passed by docker/run.sh --bench)
@@ -747,6 +756,157 @@ t_l2tp_down() {
     wait_for 30 l2tp_gone || { r 'ubus call network.interface.l2tp status'; return 1; }
 }
 
+# --- WAN link watch (a5v4-wan-watch): malta has no switch (eth1 is a card of its own), so at
+# idle the service waits without polling; the tests use the test-only link_file and interval
+# options in /etc/config/a5v4.
+WW_LINK=/tmp/bench-wan-link
+ww_daemon_idle() { r "pgrep -f '^/bin/sh /usr/libexec/a5v4-wan-watch idle'" | grep -q .; }
+ww_daemon_watch() { r "pgrep -f '^/bin/sh /usr/libexec/a5v4-wan-watch watch '" | grep -q .; }
+ww_daemon_any() { r "pgrep -f '^/bin/sh /usr/libexec/a5v4-wan-watch '" | grep -q .; }
+ww_daemon_mem() {
+    r 'd=$(pgrep -f "^/bin/sh /usr/libexec/a5v4-wan-watch " | head -n 1)
+       for p in $d $(grep -l "^PPid:[[:space:]]*$d\$" /proc/[0-9]*/status 2>/dev/null | cut -d/ -f3); do
+           printf "%s %s/%s kB, page tables %s kB; " "$(cat /proc/$p/comm)" \
+               "$(sed -n "s/^RssAnon:[[:space:]]*\([0-9]*\).*/\1/p" /proc/$p/status)" \
+               "$(sed -n "s/^VmRSS:[[:space:]]*\([0-9]*\).*/\1/p" /proc/$p/status)" \
+               "$(sed -n "s/^VmPTE:[[:space:]]*\([0-9]*\).*/\1/p" /proc/$p/status)"
+       done'
+}
+t_ww_idle() {
+    ww_daemon_idle || { echo "a5v4-wan-watch is not idle"; r "ps w | grep wan-watch"; return 1; }
+    ! ww_daemon_watch || { echo "a5v4-wan-watch is polling without a switch"; return 1; }
+    [ -z "$(r '/usr/libexec/a5v4-wan-watch detect')" ] || { echo "detect found a switch on malta"; return 1; }
+}
+t_ww_confirm_short() {
+    local pid0 pid1 logs
+    pid0="$(r 'pidof udhcpc')"
+    [ -n "$pid0" ] || { echo "no udhcpc"; return 1; }
+    # Four 3 s drops spaced 13 s apart (3 s down, 10 s up) cover every phase of the 10 s cycle
+    # while keeping each 5 s confirmation check inside an up window.
+    r "i=0
+       while [ \$i -lt 4 ]; do
+           echo '0 down' > $WW_LINK
+           sleep 3
+           echo '0 up' > $WW_LINK
+           [ \$i -lt 3 ] && sleep 10 || sleep 6
+           i=\$((i + 1))
+       done"
+    pid1="$(r 'pidof udhcpc')"
+    logs="$(r 'logread -e a5v4-wan-watch')"
+    [ "$pid0" = "$pid1" ] && [ -z "$logs" ] || {
+        echo "restarted on 3 s short drops: pid $pid0 -> $pid1, log: $logs"; return 1;
+    }
+}
+t_ww_confirm_long() {
+    local pid0 pid1 n1 n2 log_line
+    pid0="$(r 'pidof udhcpc')"
+    [ -n "$pid0" ] || { echo "no udhcpc"; return 1; }
+    r "echo '0 down' > $WW_LINK"
+    sleep 22
+    r "echo '0 up' > $WW_LINK"
+    udhcpc_restarted() {
+        local p
+        p="$(r 'pidof udhcpc' || true)"
+        [ -n "$p" ] && [ "$p" != "$pid0" ] && t_wan_dhcp
+    }
+    wait_for 25 udhcpc_restarted || {
+        echo "WAN did not restart after two-poll drop at 10 s (pid $pid0 -> $(r 'pidof udhcpc' || true))"
+        r 'logread | tail -n 15'; return 1;
+    }
+    pid1="$(r 'pidof udhcpc')"
+    n1="$(r 'logread -e a5v4-wan-watch | wc -l')"
+    log_line="$(r 'logread -e a5v4-wan-watch' | tail -n 1)"
+    [ "$n1" -eq 1 ] && echo "$log_line" | grep -Eq 'port 0 up after [2-9][0-9]* polls down, restarting:.*wan' || {
+        echo "expected 1 restart log line, got $n1: $log_line"; return 1;
+    }
+    sleep 12
+    n2="$(r 'logread -e a5v4-wan-watch | wc -l')"
+    [ "$n2" -eq 1 ] && [ "$(r 'pidof udhcpc')" = "$pid1" ] || {
+        echo "restarted more than once: lines $n1 -> $n2, pid $pid1 -> $(r 'pidof udhcpc')"; return 1;
+    }
+}
+t_ww_steady() {
+    local pid0 pid1 n0 n1
+    pid0="$(r 'pidof udhcpc')"
+    [ -n "$pid0" ] || { echo "no udhcpc"; return 1; }
+    n0="$(r 'logread -e a5v4-wan-watch | wc -l')"
+    sleep 11
+    pid1="$(r 'pidof udhcpc')"
+    n1="$(r 'logread -e a5v4-wan-watch | wc -l')"
+    [ "$pid0" = "$pid1" ] && [ "$n0" = "$n1" ] || {
+        echo "restarted while link stayed up: pid $pid0 -> $pid1, log lines $n0 -> $n1"; return 1;
+    }
+}
+wan_addr_2xx() { wan_addr | grep -q '^192\.0\.2\.2[0-5][0-9]$'; }
+t_ww_dhcp_recover() {
+    local v6_before v6_after log_line
+    v6_before="$(r 'pidof odhcp6c' || true)"
+    r "echo '0 down' > $WW_LINK"
+    sleep 7
+    wan_dnsmasq_start 192.0.2.200 192.0.2.250
+    r "echo '0 up' > $WW_LINK"
+    wait_for 25 wan_addr_2xx || { echo "WAN did not get 192.0.2.2xx: $(wan_addr)"; r 'logread | tail -n 15'; return 1; }
+    log_line="$(r 'logread -e a5v4-wan-watch' | tail -n 1)"
+    echo "$log_line" | grep -Eq 'port 0 up after [2-9][0-9]* polls down, restarting:.*wan' || {
+        echo "missing/unexpected log line: $log_line"; return 1;
+    }
+    if [ "$IPV6_KERNEL" = yes ]; then
+        v6_after="$(r 'pidof odhcp6c' || true)"
+        [ -n "$v6_before" ] && [ -n "$v6_after" ] && [ "$v6_before" != "$v6_after" ] || {
+            echo "wan6 (odhcp6c) was not restarted: $v6_before -> $v6_after"; return 1;
+        }
+    fi
+    t_nat_settled
+}
+t_ww_off() {
+    r 'uci set a5v4.network.wan_watch=0; uci commit a5v4; /etc/init.d/a5v4-wan-watch reload' >/dev/null
+    sleep 2
+    ! ww_daemon_any || { echo "a5v4-wan-watch still running when disabled"; r 'ps w | grep wan-watch'; return 1; }
+}
+t_ww_control() {
+    local old_addr new_addr
+    old_addr="$(wan_addr)"
+    echo "$old_addr" | grep -q '^192\.0\.2\.2[0-5][0-9]$' || { echo "unexpected initial addr: $old_addr"; return 1; }
+    r "echo '0 down' > $WW_LINK"
+    sleep 7
+    wan_dnsmasq_start 192.0.2.100 192.0.2.150
+    r "echo '0 up' > $WW_LINK"
+    sleep 10
+    new_addr="$(wan_addr)"
+    [ "$old_addr" = "$new_addr" ] || { echo "address changed with service off: $old_addr -> $new_addr"; return 1; }
+}
+t_ww_pppoe() {
+    local pid0
+    wan_pppoe
+    wait_for 90 pppoe_addr || { echo "PPPoE did not come up"; return 1; }
+    pid0="$(r 'pidof pppd')"
+    [ -n "$pid0" ] || { echo "no pppd"; return 1; }
+    r "echo '0 down' > $WW_LINK"
+    sleep 7
+    r "echo '0 up' > $WW_LINK"
+    pppd_restarted() {
+        local p
+        p="$(r 'pidof pppd' || true)"
+        [ -n "$p" ] && [ "$p" != "$pid0" ] && pppoe_addr
+    }
+    wait_for 90 pppd_restarted || { echo "PPPoE did not recover (pid $pid0 -> $(r 'pidof pppd' || true))"; r 'logread | tail -n 15'; return 1; }
+    t_nat_settled
+}
+t_ww_l2tp() {
+    wan_dhcp
+    wait_for 60 t_wan_dhcp || { echo "DHCP WAN not up before L2TP"; return 1; }
+    l2tp_uci_add reload
+    wait_for 90 l2tp_addr || { echo "L2TP did not come up before flap"; return 1; }
+    r "echo '0 down' > $WW_LINK"
+    sleep 7
+    wan_dnsmasq_start 192.0.2.200 192.0.2.250
+    r "echo '0 up' > $WW_LINK"
+    wait_for 25 wan_addr_2xx || { echo "DHCP WAN did not recover to 2xx: $(wan_addr)"; return 1; }
+    l2tp_ping() { l2tp_addr && r 'ping -c 2 -W 2 -I l2tp-l2tp 10.65.0.1' >/dev/null 2>&1; }
+    wait_for 90 l2tp_ping || { echo "L2TP did not recover after WAN restart"; r 'logread | tail -n 20'; return 1; }
+    r 'ping -c 3 -W 2 -I l2tp-l2tp 10.65.0.1'
+}
+
 # --- WireGuard (remote access to the router through a tunnel with a host on the WAN side)
 wg_handshake() { nsx wan wg show wg0 latest-handshakes | awk '$2 > 0' | grep -q .; }
 t_wg_handshake() { wait_for 60 wg_handshake; }
@@ -920,6 +1080,12 @@ if r '[ -x /usr/libexec/fwupdate ]'; then
 else
     skip "update checker at idle" "the image has no luci-app-fwupdate"
 fi
+if r '[ -x /usr/libexec/a5v4-wan-watch ]'; then
+    check "WAN watch at idle: waits without polling when WAN is not on a switch" t_ww_idle
+    info "memory of a5v4-wan-watch asleep: $(ww_daemon_mem)(private/resident)"
+else
+    skip "WAN watch at idle" "the image has no a5v4-wan-watch"
+fi
 
 section "LAN services"
 check "DHCP lease on the LAN" t_lan_dhcp
@@ -1037,6 +1203,62 @@ else
     info "memory with L2TP up: $(r "grep -E 'MemAvailable' /proc/meminfo" | tr -s ' ')"
     check "L2TP down: address gone after ifdown l2tp" t_l2tp_down
     l2tp_uci_del
+fi
+
+section "WAN link watch"
+if ! r '[ -x /usr/libexec/a5v4-wan-watch ]'; then
+    skip "WAN link watch" "the image has no a5v4-wan-watch"
+else
+    # First with a 10 s interval, where the 5 s down confirmation is active
+    r "echo '0 up' > $WW_LINK
+       uci set a5v4.network=network
+       uci set a5v4.network.wan_watch_link_file=$WW_LINK
+       uci set a5v4.network.wan_watch_interval=10
+       uci commit a5v4
+       /etc/init.d/a5v4-wan-watch reload" >/dev/null
+    sleep 2
+    check "WAN watch (10 s, 5 s confirm): 3 s short drops do not restart" t_ww_confirm_short
+    check "WAN watch (10 s, 5 s confirm): drop over two polls restarts once" t_ww_confirm_long
+    info "WAN watch 10 s log: $(r 'logread -e a5v4-wan-watch' | tail -n 1)"
+    # Switch to a 3 s interval for the remaining checks
+    r "uci set a5v4.network.wan_watch_interval=3
+       uci commit a5v4
+       /etc/init.d/a5v4-wan-watch reload" >/dev/null
+    sleep 2
+    check "WAN watch: no restart over several polls while link is up" t_ww_steady
+    check "WAN watch: recovers DHCP lease after link down and up, restarts wan6" t_ww_dhcp_recover
+    info "WAN watch log: $(r 'logread -e a5v4-wan-watch' | tail -n 1)"
+    check "WAN watch off: no daemon runs" t_ww_off
+    check "WAN watch control (service off): stale DHCP lease stays" t_ww_control
+    # Restore service on and WAN back to 192.0.2.1xx
+    r 'uci -q delete a5v4.network.wan_watch; uci commit a5v4; /etc/init.d/a5v4-wan-watch reload; ifup wan' >/dev/null
+    wait_for 60 t_wan_dhcp || true
+    if [ "$PPPOE_OK" = 1 ]; then
+        check "WAN watch: PPPoE session comes back after link flap" t_ww_pppoe
+        wan_dhcp
+        wait_for 60 t_wan_dhcp || true
+    else
+        skip "WAN watch PPPoE" "no pppoe-server on the WAN side"
+    fi
+    if has xl2tpd && [ "$L2TP_OK" = 1 ]; then
+        check "WAN watch: L2TP over DHCP WAN comes back after link flap" t_ww_l2tp
+        wan_dnsmasq_start 192.0.2.100 192.0.2.150
+        r 'ifup wan' >/dev/null
+        l2tp_uci_del
+    else
+        skip "WAN watch L2TP" "no xl2tpd or LNS"
+        wan_dnsmasq_start 192.0.2.100 192.0.2.150
+    fi
+    # Remove test-only options and ensure WAN is back on 192.0.2.1xx
+    r "uci -q delete a5v4.network.wan_watch_link_file
+       uci -q delete a5v4.network.wan_watch_interval
+       uci -q delete a5v4.network.wan_watch
+       uci commit a5v4
+       rm -f $WW_LINK
+       /etc/init.d/a5v4-wan-watch reload" >/dev/null
+    t_wan_dhcp || { r 'ifup wan' >/dev/null; wait_for 60 t_wan_dhcp || true; }
+    sleep 2
+    check "WAN watch restored to idle without test link source" t_ww_idle
 fi
 
 section "WireGuard"

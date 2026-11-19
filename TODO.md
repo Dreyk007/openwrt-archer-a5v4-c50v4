@@ -147,6 +147,17 @@ sources*).
 
 ### On the router
 
+- **Automatic channel selection** (`package/kernel/mt76/patches/0333`, `0334`;
+  `package/network/services/hostapd/patches/471`, `472`,
+  the presets, `feeds-patches/luci/0001-*.patch`,
+  [RESEARCH.md section 19](RESEARCH.md#19-automatic-channel-selection)): checked on 2026-11-19
+  with a debug and a test image (the `mac_work` trace, the fresh survey after a scan, the time
+  and choice of ACS per band, 3 hours on the test image). Left, on the release:
+  - the update with the settings kept: the presets are added once and the user's channels stay;
+  - the two checkboxes clicked in LuCI (the bench checks them only by grep): shown only with the
+    channel `auto`, and their writes of `channels` and `acs_exclude_dfs`;
+  - the 5 GHz radio over days, now that `mac_work` runs beside `0328`–`0331`: `MAC error
+    detected`, `MAC stop failed`, TX hangs and disconnects for missing ACKs.
 - Before the first flash: the dump of all partitions. After it: the checks of
   [UPGRADING.md appendix C](UPGRADING.md#appendix-c-on-device-verification), both radios, all
   ports.
@@ -379,6 +390,27 @@ the table in AGENTS.md gets the link.
   ([RESEARCH.md section 6](RESEARCH.md#6-wi-fi-driver-fixes-from-mt76-master)). **Not ready:** it
   needs the test on the router with a dev build that has debugfs (`Sensitivity:` moving on a busy
   channel, A/B of the channel busy time and the ping loss) first.
+- **mt76x02: restart `mac_work` after a channel change (`0333`)** → openwrt/mt76
+  ([RESEARCH.md section 19](RESEARCH.md#19-automatic-channel-selection)): `mt76_set_channel()`
+  cancels `phy->mac_work`, and `mt76x02` lost the re-queue in `f4fdd7716290` ("partially move
+  channel change code to core"), so `mt76x02_mac_work` (survey updates, `ampdu_stat` A-MPDU
+  counters, beacon-hang MAC reset, ED/CCA monitor when turned on in debugfs, and stale TX
+  status sweep) stops on the first channel set right after `mt76x2_start()` and never runs while
+  the AP is up (`wdt_work` TX hang check is separate). Upstream draft covers `mt76x2/pci_main.c`,
+  `mt76x2/usb_main.c` and `mt76x0/main.c`; test on the router first.
+- **mt76: reset operating channel survey on software scan (`0334`)** → openwrt/mt76
+  ([RESEARCH.md section 19](RESEARCH.md#19-automatic-channel-selection)): `__mt76_set_channel()`
+  clears `chan_state` only for non-operating channels, leaving `phy->main_chandef.chan` with hours
+  of accumulated traffic during `mt76_sw_scan()`. Flushing via `mt76_update_survey()` under
+  `dev->mutex` and zeroing `main_chandef.chan`'s `chan_state` under `dev->cc_lock` keeps ACS fair
+  on AP restarts; check lock behavior across `mt7615`/`mt7915` and test on the router first.
+- **hostapd: one log line for missing ACS survey fields (`471`)** → openwrt/openwrt
+  ([RESEARCH.md section 19](RESEARCH.md#19-automatic-channel-selection)): update OpenWrt's
+  `470-survey_data_fallback.patch` so missing noise floor / channel time / busy time logs once
+  per missing field per ACS run as `MSG_INFO` (up to three lines over all scans) instead of
+  emitting per-survey `MSG_INFO` lines (152 on 2.4 GHz / 183 on 5 GHz measured without the fix).
+  (`472-acs_scan_duration.patch` keeps `duration_advisory` local for drivers without
+  `SET_SCAN_DWELL` and stays out of upstream.)
 - **mt76x02: optimize 5 GHz TX cleanup and status polling (`0328`–`0331`)** → openwrt/mt76
   ([RESEARCH.md section 12](RESEARCH.md#12-tests-on-the-router)): submit **`0328`** (`mt76x02`:
   skip `mt76_queue_tx_cleanup()` in `mt76x02_clean_tx_queue()` for idle TX queues) first as the
@@ -430,6 +462,14 @@ Each patch the fork carries gets an item here: what it waits for, and when to dr
   ([UPGRADING.md section 2.2](UPGRADING.md#22-merge-the-new-tag)).
 - **The 5 GHz TX optimizations** (`0328`–`0331`): drop each one when upstream mt76 merges it, or
   adapt the remaining patches and `tx_opt` bits around what was merged.
+- **ACS driver fixes** (`0333`, `0334`): drop `0333` when upstream `mt76` restores `mac_work` re-queue
+  in `mt76x02` `set_channel`; drop `0334` when `mt76_sw_scan()` resets the operating channel's
+  survey.
+- **hostapd ACS patches** (`471`, `472`): drop `471` when OpenWrt updates
+  `470-survey_data_fallback.patch`; keep `472` (`acs_scan_duration` + `duration_advisory`) local and
+  recheck `driver.h`, `driver_nl80211_scan.c`, and `wpa_supplicant/scan.c` on hostapd updates.
+- **LuCI auto-channel patch** (`feeds-patches/luci/0001-*.patch`): drop if OpenWrt's LuCI feed
+  adds equivalent options for `channels` (`1-11`/`1-13`) and `acs_exclude_dfs`.
 - **GCC 15.3.0** (three commits of OpenWrt main, [UPGRADING.md section 1.1](UPGRADING.md#11-this-builds-commits)):
   drop them once the series builds 15.3.0 or newer by default.
 - **WAN link watch** (`files/etc/init.d/a5v4-wan-watch`, `files/usr/libexec/a5v4-wan-watch`,

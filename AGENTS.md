@@ -187,6 +187,9 @@ Waiting upstream (update this list when one is merged or closed, and drop the fo
 | ramips: rt3050-esw: keep the WAN port disabled until it is configured (`RESEARCH.md` section 1) | not yet: checked on the router, to submit to openwrt/openwrt |
 | https-dns-proxy: keep the backup of an empty dnsmasq server list (`feeds-patches/packages/0001-*.patch`, `RESEARCH.md` section 14) | not yet: submit to openwrt/packages |
 | mt76x02: fewer register reads in the 5 GHz TX path (`0328`–`0331`, `RESEARCH.md` section 12) | not yet: `0328` first, to openwrt/mt76 (`TODO.md`, To submit upstream) |
+| mt76x02: restart `mac_work` after a channel change (`0333`, `RESEARCH.md` section 19) | not yet: to openwrt/mt76 and linux-wireless after days on the release (`TODO.md`, To submit upstream) |
+| mt76: a fresh survey of the operating channel at a scan (`0334`, `RESEARCH.md` section 19) | not yet: check the locks of the other drivers that use `mt76_sw_scan()` first |
+| hostapd: one log line for incomplete ACS survey data (`471`, an update of OpenWrt's `470`) | not yet: to openwrt/openwrt |
 
 ## Working with the owner
 

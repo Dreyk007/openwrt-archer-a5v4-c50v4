@@ -306,7 +306,9 @@ Details: [RESEARCH.md](RESEARCH.md#12-tests-on-the-router), [the chips](RESEARCH
     `/etc/modules.conf` and reboot.
 * **Tips:**
   * **40 MHz on 2.4 GHz** gave no more speed among the neighbouring networks, and takes their air: 20 MHz stays.
-  * **The automatic channel choice of 5 GHz** takes about 2 minutes after every start of the radio; a fixed channel needs none.
+  * **Automatic channel selection (`auto`):** fixed channels stay the default (channel 1 on 2.4 GHz, channel 36 on 5 GHz, instant startup). If you choose `auto` in LuCI (*Network → Wireless* → *Edit* → *General Setup*), the build pre-configures faster presets instead of hostapd's ~27 s default scan: **~12 s on 2.4 GHz** (channels 1–11, 2 passes, preferring channels 1, 6 and 11) and **~8 s on 5 GHz** (1 pass, excluding DFS channels and channels limited below 15 dBm such as EU channels 149–165 at 25 mW). Two checkboxes appear when *Channel* is set to `auto`:
+    * *2.4 GHz:* **Include channels 12 and 13 in automatic channel selection** (off by default, so devices configured for the US still see the network);
+    * *5 GHz:* **Include DFS channels in automatic channel selection** (off by default, skipping 1–10 min radar checks and radar-forced channel switches; where every 5 GHz channel needs a radar check, automatic selection works only with this box on).
   * **Channels 52–64** have no radar detection under `PA`. Under the rules of most European countries they need a 1-minute check
     at every start, and a switch when a radar shows up.
 

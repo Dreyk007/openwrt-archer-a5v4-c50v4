@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreyk <dreyksmail@gmail.com>
+Date: Thu, 19 Nov 2026 17:37:01 +0200
+Subject: [PATCH 2/2] wifi: mt76: reset operating channel survey on software
+ scan
+
+__mt76_set_channel() clears chan_state only when tuning to a channel
+other than main_chandef.chan. As a result, a software scan (including
+ACS when a radio is restarted) finds the operating channel with hours
+of accumulated active, busy, TX, and BSS-RX history, while every other
+channel covers only the scan dwell. Traffic from the AP's own clients
+then makes the current channel look busy compared to idle channels.
+
+In mt76_sw_scan(), take dev->mutex, fold any pending hardware counters
+and elapsed time into the current state via mt76_update_survey(), and
+then zero the main channel's chan_state under dev->cc_lock (matching
+mt7603_mac_tx_stats and mt76x02_update_channel() which update cc_tx
+under cc_lock). Reading MT_MIB_STAT_CCA (mt7603, clear-on-read) and
+MT_CH_BUSY (mt76x2, read-and-clear) inside mt76_update_survey() before
+zeroing chan_state ensures no counts are lost or double-counted across
+the scan boundary.
+
+Side effects checked across image consumers:
+- Only `iw ... survey dump` shows the operating channel's counters
+  since the last scan (ACS, LuCI scan button, or travelmate WISP scan)
+  rather than since boot; /usr/bin/iwinfo (a ucode script) has no
+  survey command, and libiwinfo (libiwinfo.so.20230701) and iwinfo.uc
+  (rpcd-mod-iwinfo) read only the noise.
+- LuCI wireless.js reads only noise from GET_SURVEY; LuCI scan and
+  travelmate/wpa_supplicant read scan results, not survey busy time.
+- hostapd BSS Load (when bss_load_update_period is enabled) computes
+  deltas only when channel_time increases, so a reset skips one interval
+  and resyncs cleanly.
+---
+ mac80211.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/mac80211.c b/mac80211.c
+index 7d27f952..7755e71b 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1968,6 +1968,19 @@ void mt76_sw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		  const u8 *mac)
+ {
+ 	struct mt76_phy *phy = hw->priv;
++	struct mt76_dev *dev = phy->dev;
++
++	mutex_lock(&dev->mutex);
++	mt76_update_survey(phy);
++	if (phy->main_chandef.chan) {
++		struct mt76_channel_state *state;
++
++		state = mt76_channel_state(phy, phy->main_chandef.chan);
++		spin_lock_bh(&dev->cc_lock);
++		memset(state, 0, sizeof(*state));
++		spin_unlock_bh(&dev->cc_lock);
++	}
++	mutex_unlock(&dev->mutex);
+ 
+ 	set_bit(MT76_SCANNING, &phy->state);
+ }

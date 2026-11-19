@@ -197,10 +197,10 @@ jobs:
             echo
             echo "| | File | Size |"
             echo "|---|---|---|"
-            echo "| **The firmware:** installation from OpenWrt, updates (keep the settings), and the content of the recovery file \`tp_recovery.bin\` for an installation from the stock firmware | $(link "$image") | $(size "$image") |"
+            echo "| **Firmware** | $(link "$image") | $(size "$image") |"
             echo "| Checksums of all files | $(link sha256sums) | $(size sha256sums) |"
             echo
-            echo "Never upload the firmware in the TP-Link web interface: from the stock firmware it goes through the TFTP recovery ([installation guide]($url/blob/$GITHUB_SHA/README.md#installation))."
+            echo "Do not upload this file in the TP-Link web interface. From the stock firmware, follow the [installation guide]($url/blob/$GITHUB_SHA/README.md#installation)."
             echo
             echo "<details><summary>Other files</summary>"
             echo
